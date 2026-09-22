@@ -37,11 +37,11 @@ st.set_page_config(page_title="PC Fund Tracker", page_icon="💻", layout="wide"
 # 🎨 注入自訂 CSS 
 st.markdown("""
 <style>
-    /* 🌟 放大輸入框上方的細項標題文字 */
+    /* 放大輸入框上方的細項標題文字 */
     [data-testid="stWidgetLabel"] p {
         font-size: 18px !important;
         font-weight: 600 !important;
-        color: #E0E0E0 !important; /* 讓文字稍微亮一點點 */
+        color: #E0E0E0 !important;
     }
 
     /* 針對所有數字與文字輸入框：放大字體、增加高度 */
@@ -245,28 +245,45 @@ with row2_col2:
 
 st.divider()
 
-# ---- 4. 目前投資組合損益表 ----
-st.header("📊 目前投資組合 (即時損益)")
+# ---- 4. 股票買入明細與獨立即時損益表 ----
+st.header("📊 股票買入明細與即時損益 (按每筆交易獨立顯示)")
 
-portfolio_display = []
-for ticker, info in holdings.items():
-    if info['shares'] > 0:
-        live_price = get_live_price(ticker)
-        avg_cost = info['total_cost'] / info['shares']
-        current_value = live_price * info['shares']
-        unrealized_pl = current_value - info['total_cost']
-        roi_percent = (unrealized_pl / info['total_cost']) * 100 if info['total_cost'] > 0 else 0
+trade_display = []
+for tx in data['transactions']:
+    if tx['type'] == 'buy':
+        ticker = tx['ticker']
+        shares = tx['shares']
+        buy_price = tx['price']
+        fee = tx['fee']
+        total_cost = (buy_price * shares) + fee
         
-        portfolio_display.append({
-            "股票代號": ticker, "持有股數": info['shares'], "平均成本 (含手續費)": avg_cost,
-            "目前現價": live_price, "目前市值": int(current_value), "未實現損益": int(unrealized_pl), "報酬率 (%)": round(roi_percent, 2)
+        live_price = get_live_price(ticker)
+        current_value = live_price * shares
+        unrealized_pl = current_value - total_cost
+        roi_percent = (unrealized_pl / total_cost) * 100 if total_cost > 0 else 0
+        
+        trade_display.append({
+            "成交日期": tx['date'],
+            "股票代號": ticker,
+            "買入股數": shares,
+            "成交單價": buy_price,
+            "手續費": fee,
+            "目前現價": live_price,
+            "目前市值": int(current_value),
+            "未實現損益": int(unrealized_pl),
+            "報酬率 (%)": round(roi_percent, 2)
         })
 
-if portfolio_display:
-    df = pd.DataFrame(portfolio_display)
+if trade_display:
+    df = pd.DataFrame(trade_display)
     styled_df = df.style.format({
-        "持有股數": "{:,}", "平均成本 (含手續費)": "{:,.2f}", "目前現價": "{:,.2f}", "目前市值": "{:,}", "未實現損益": "{:,}"
+        "買入股數": "{:,}",
+        "成交單價": "{:,.2f}",
+        "手續費": "{:,}",
+        "目前現價": "{:,.2f}",
+        "目前市值": "{:,}",
+        "未實現損益": "{:,}"
     })
     st.dataframe(styled_df, use_container_width=True)
 else:
-    st.info("目前沒有庫存股票，快去買進第一檔股票吧！")
+    st.info("目前沒有買入交易紀錄，快去買進第一檔股票吧！")
