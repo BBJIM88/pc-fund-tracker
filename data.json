@@ -1,0 +1,368 @@
+{
+    "cash_account": {
+        "balance": 6509.0,
+        "history": [
+            {
+                "date": "2026-09-23 01:39:46",
+                "action": "deposit",
+                "amount": 10000,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:03:11",
+                "action": "deposit",
+                "amount": 0,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:03:16",
+                "action": "deposit",
+                "amount": 0,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:03:23",
+                "action": "deposit",
+                "amount": 0,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:03:25",
+                "action": "deposit",
+                "amount": 0,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:03:27",
+                "action": "deposit",
+                "amount": 0,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:03:27",
+                "action": "deposit",
+                "amount": 0,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:03:27",
+                "action": "deposit",
+                "amount": 0,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:03:27",
+                "action": "deposit",
+                "amount": 0,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:03:28",
+                "action": "deposit",
+                "amount": 0,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:03:28",
+                "action": "deposit",
+                "amount": 0,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:03:28",
+                "action": "deposit",
+                "amount": 0,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:03:38",
+                "action": "deposit",
+                "amount": 988,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:03:45",
+                "action": "deposit",
+                "amount": 1,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:03:49",
+                "action": "deposit",
+                "amount": 1,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:03:51",
+                "action": "deposit",
+                "amount": 1,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:03:53",
+                "action": "deposit",
+                "amount": 1,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:03:57",
+                "action": "deposit",
+                "amount": 1,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:03:59",
+                "action": "deposit",
+                "amount": 1,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:04:27",
+                "action": "deposit",
+                "amount": 1,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:04:55",
+                "action": "deposit",
+                "amount": 1,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:04:57",
+                "action": "deposit",
+                "amount": 1,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:05:00",
+                "action": "deposit",
+                "amount": 1,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:05:02",
+                "action": "deposit",
+                "amount": 1,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:05:03",
+                "action": "deposit",
+                "amount": 1,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:05:08",
+                "action": "deposit",
+                "amount": 1,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:05:10",
+                "action": "deposit",
+                "amount": 1,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:05:11",
+                "action": "deposit",
+                "amount": 1,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:05:21",
+                "action": "deposit",
+                "amount": 213,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:20:57",
+                "action": "deposit",
+                "amount": 1234,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:20:59",
+                "action": "deposit",
+                "amount": 1234,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:21:07",
+                "action": "deposit",
+                "amount": 1000,
+                "note": ""
+            }
+        ]
+    },
+    "target_hardware": {
+        "current_target": 100000,
+        "history": [
+            {
+                "date": "2026-09-23 01:40:06",
+                "price": 40000,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 01:48:42",
+                "price": 0,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 01:49:06",
+                "price": 1,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:04:03",
+                "price": 0,
+                "note": ""
+            },
+            {
+                "date": "2026-09-23 02:20:48",
+                "price": 100000,
+                "note": ""
+            }
+        ]
+    },
+    "transactions": [
+        {
+            "tx_id": "20260923014048",
+            "date": "2026-09-23 01:40:48",
+            "type": "buy",
+            "ticker": "2330.TW",
+            "price": 1000.0,
+            "shares": 5,
+            "fee": 18
+        },
+        {
+            "tx_id": "20260923014545",
+            "date": "2026-09-23 01:45:45",
+            "type": "buy",
+            "ticker": "006208.TW",
+            "price": 13.0,
+            "shares": 1,
+            "fee": 0
+        },
+        {
+            "tx_id": "20260923022023",
+            "date": "2026-09-23 02:20:23",
+            "type": "buy",
+            "ticker": "0050.TW",
+            "price": 123.0,
+            "shares": 1,
+            "fee": 0
+        }
+    ],
+    "dividends": [
+        {
+            "date": "2026-09-23 01:41:41",
+            "ticker": "2330.TW",
+            "amount": 150,
+            "note": ""
+        },
+        {
+            "date": "2026-09-23 02:04:09",
+            "ticker": "006208.TW",
+            "amount": 0,
+            "note": "123"
+        },
+        {
+            "date": "2026-09-23 02:08:28",
+            "ticker": "006208.TW",
+            "amount": 123,
+            "note": ""
+        },
+        {
+            "date": "2026-09-23 02:08:32",
+            "ticker": "006208.TW",
+            "amount": 123,
+            "note": ""
+        },
+        {
+            "date": "2026-09-23 02:08:33",
+            "ticker": "006208.TW",
+            "amount": 123,
+            "note": ""
+        },
+        {
+            "date": "2026-09-23 02:08:34",
+            "ticker": "006208.TW",
+            "amount": 123,
+            "note": ""
+        },
+        {
+            "date": "2026-09-23 02:08:36",
+            "ticker": "006208.TW",
+            "amount": 123,
+            "note": ""
+        },
+        {
+            "date": "2026-09-23 02:08:39",
+            "ticker": "006208.TW",
+            "amount": 123,
+            "note": ""
+        },
+        {
+            "date": "2026-09-23 02:08:44",
+            "ticker": "006208.TW",
+            "amount": 123,
+            "note": ""
+        },
+        {
+            "date": "2026-09-23 02:08:50",
+            "ticker": "006208.TW",
+            "amount": 123,
+            "note": ""
+        },
+        {
+            "date": "2026-09-23 02:08:52",
+            "ticker": "006208.TW",
+            "amount": 123,
+            "note": ""
+        },
+        {
+            "date": "2026-09-23 02:09:02",
+            "ticker": "006208.TW",
+            "amount": 123,
+            "note": ""
+        },
+        {
+            "date": "2026-09-23 02:09:05",
+            "ticker": "006208.TW",
+            "amount": 123,
+            "note": ""
+        },
+        {
+            "date": "2026-09-23 02:09:07",
+            "ticker": "006208.TW",
+            "amount": 123,
+            "note": ""
+        },
+        {
+            "date": "2026-09-23 02:09:09",
+            "ticker": "006208.TW",
+            "amount": 123,
+            "note": ""
+        },
+        {
+            "date": "2026-09-23 02:10:43",
+            "ticker": "006208.TW",
+            "amount": 124,
+            "note": ""
+        },
+        {
+            "date": "2026-09-23 02:21:15",
+            "ticker": "006208.TW",
+            "amount": 124,
+            "note": ""
+        }
+    ],
+    "daily_snapshots": {
+        "2026-09-23": {
+            "total_assets": 19176,
+            "target_price": 100000
+        }
+    }
+}
