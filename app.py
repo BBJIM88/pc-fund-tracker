@@ -15,6 +15,10 @@ def load_data():
             data = json.load(f)
             if "daily_snapshots" not in data:
                 data["daily_snapshots"] = {}
+            if "dividends" not in data:
+                data["dividends"] = []
+            if "history" not in data["cash_account"]:
+                data["cash_account"]["history"] = []
             return data
     return {"cash_account": {"balance": 0, "history": []}, "target_hardware": {"current_target": 0, "history": []}, "transactions": [], "dividends": [], "daily_snapshots": {}}
 
@@ -246,7 +250,7 @@ with row2_col2:
 st.divider()
 
 # ---- 4. 股票買入明細與獨立即時損益表 ----
-st.header("📊 股票買入明細與即時損益 (按每筆交易獨立顯示)")
+st.header("📊 股票買入明細與即時損益")
 
 trade_display = []
 for tx in data['transactions']:
@@ -271,12 +275,14 @@ for tx in data['transactions']:
             "目前現價": live_price,
             "目前市值": int(current_value),
             "未實現損益": int(unrealized_pl),
-            "報酬率 (%)": round(roi_percent, 2)
+            "報酬率 (%)": round(roi_percent, 2),
+            "tx_id": tx['tx_id']
         })
 
 if trade_display:
     df = pd.DataFrame(trade_display)
-    styled_df = df.style.format({
+    display_df = df.drop(columns=["tx_id"])
+    styled_df = display_df.style.format({
         "買入股數": "{:,}",
         "成交單價": "{:,.2f}",
         "手續費": "{:,}",
@@ -287,3 +293,66 @@ if trade_display:
     st.dataframe(styled_df, use_container_width=True)
 else:
     st.info("目前沒有買入交易紀錄，快去買進第一檔股票吧！")
+
+st.divider()
+
+# ---- 5. 🗑️ 管理與刪除誤植紀錄專區 ----
+with st.expander("⚙️ 管理與刪除誤植紀錄 (點擊展開)"):
+    del_tab1, del_tab2, del_tab3 = st.tabs(["刪除買入交易", "刪除股息紀錄", "刪除現金存入紀錄"])
+    
+    with del_tab1:
+        st.subheader("🛒 刪除錯誤的買入紀錄")
+        if data['transactions']:
+            tx_options = {f"[{tx['date']}] 買入 {tx['ticker']} - {tx['shares']}股 @ {tx['price']} (手續費: {tx['fee']})": tx['tx_id'] for tx in data['transactions']}
+            selected_tx_label = st.selectbox("選擇要刪除的買入紀錄", options=list(tx_options.keys()))
+            
+            if st.button("確認刪除此筆買入紀錄 (並自動退回現金)"):
+                target_tx_id = tx_options[selected_tx_label]
+                target_tx = next((tx for tx in data['transactions'] if tx['tx_id'] == target_tx_id), None)
+                if target_tx:
+                    refund_amount = (target_tx['price'] * target_tx['shares']) + target_tx['fee']
+                    data['cash_account']['balance'] += refund_amount
+                    data['transactions'] = [tx for tx in data['transactions'] if tx['tx_id'] != target_tx_id]
+                    save_data(data)
+                    st.success(f"已成功刪除該筆交易，並自動退回現金 NT$ {int(refund_amount):,}！")
+                    st.rerun()
+        else:
+            st.info("目前沒有任何買入交易可刪除。")
+
+    with del_tab2:
+        st.subheader("💸 刪除錯誤的股息紀錄")
+        if data['dividends']:
+            div_options = {f"[{div['date']}] {div['ticker']} - 配息 NT$ {div['amount']} ({div.get('note', '')})": i for i, div in enumerate(data['dividends'])}
+            selected_div_label = st.selectbox("選擇要刪除的股息紀錄", options=list(div_options.keys()))
+            
+            if st.button("確認刪除此筆股息 (並自動扣回現金)"):
+                div_idx = div_options[selected_div_label]
+                target_div = data['dividends'][div_idx]
+                deduct_amount = target_div['amount']
+                
+                data['cash_account']['balance'] -= deduct_amount
+                data['dividends'].pop(div_idx)
+                save_data(data)
+                st.success(f"已成功刪除該筆股息紀錄，並自動扣回現金 NT$ {int(deduct_amount):,}！")
+                st.rerun()
+        else:
+            st.info("目前沒有任何股息紀錄可刪除。")
+
+    with del_tab3:
+        st.subheader("💰 刪除錯誤的現金存入紀錄")
+        if data['cash_account']['history']:
+            dep_options = {f"[{dep['date']}] 存入 NT$ {dep['amount']} ({dep.get('note', '')})": i for i, dep in enumerate(data['cash_account']['history'])}
+            selected_dep_label = st.selectbox("選擇要刪除的現金存入紀錄", options=list(dep_options.keys()))
+            
+            if st.button("確認刪除此筆現金紀錄 (並自動扣回現金)"):
+                dep_idx = dep_options[selected_dep_label]
+                target_dep = data['cash_account']['history'][dep_idx]
+                deduct_amount = target_dep['amount']
+                
+                data['cash_account']['balance'] -= deduct_amount
+                data['cash_account']['history'].pop(dep_idx)
+                save_data(data)
+                st.success(f"已成功刪除該筆現金紀錄，並自動扣回現金 NT$ {int(deduct_amount):,}！")
+                st.rerun()
+        else:
+            st.info("目前沒有任何現金存入紀錄可刪除。")
