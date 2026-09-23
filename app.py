@@ -266,6 +266,89 @@ def price_all(state):
     return prices, money(portfolio), money(state["balance"] + portfolio)
 
 
+def cumulative_principal(state):
+    """All valid deposits; withdrawals do not change historical contributions."""
+    return money(sum((entry["amount"] for entry in state["deposits"]), Decimal("0.00")))
+
+
+def investment_profit(state, prices):
+    if any(result is None for result in prices.values()):
+        return None
+    realized = sum((sale["realized"] for sale in state["sells"]), Decimal("0.00"))
+    unrealized = sum(
+        (prices[lot["ticker"]]["price"] * lot["remaining"] - lot["remaining_cost"]
+         for lot in state["buys"] if lot["remaining"]),
+        Decimal("0.00"),
+    )
+    dividends = sum((entry["amount"] for entry in state["dividends"]), Decimal("0.00"))
+    return money(realized + unrealized + dividends)
+
+
+def render_metric_header(state, portfolio, assets, profit):
+    metrics = [
+        ("現金餘額", amount_text(state["balance"])),
+        ("股票總市值", amount_text(portfolio) if portfolio is not None else "無法計算"),
+        ("投資損益", amount_text(profit) if profit is not None else "無法計算"),
+        ("累計存入本金", amount_text(cumulative_principal(state))),
+        ("目前總資產", amount_text(assets) if assets is not None else "無法計算"),
+        ("目標金額", amount_text(state["target"])),
+    ]
+
+    # CSS contains only static style rules. All values remain native Streamlit
+    # elements, so notes and prices cannot become executable HTML or JavaScript.
+    st.markdown("""
+    <style>
+      .st-key-pc_desktop_metrics, .st-key-pc_mobile_metrics {
+        position: fixed;
+        top: 3.5rem;
+        left: 0;
+        right: 0;
+        z-index: 999;
+        padding: 0.45rem max(1rem, calc((100vw - 1100px) / 2));
+        background: var(--st-background-color, #0e1117);
+        color: var(--st-text-color, #ffffff);
+        border-bottom: 1px solid var(--st-border-color, #444);
+        box-shadow: 0 0.25rem 0.75rem rgba(0, 0, 0, 0.2);
+      }
+      .st-key-pc_desktop_metrics [data-testid="stMetricValue"] {
+        font-size: clamp(1.1rem, 2vw, 1.8rem);
+        overflow-wrap: anywhere;
+      }
+      .st-key-pc_mobile_metrics { display: none; }
+      .pc-metrics-spacer { height: 12rem; }
+      @media (max-width: 767px) {
+        .st-key-pc_desktop_metrics { display: none; }
+        .st-key-pc_mobile_metrics {
+          display: block;
+          padding: 0.35rem 0.75rem;
+        }
+        .st-key-pc_mobile_metrics [data-testid="stMetricValue"] {
+          font-size: clamp(1rem, 5vw, 1.4rem);
+          white-space: nowrap;
+        }
+        .pc-metrics-spacer { height: 4.75rem; }
+      }
+    </style>
+    """, unsafe_allow_html=True)
+
+    with st.container(key="pc_desktop_metrics"):
+        first_row = st.columns(3)
+        second_row = st.columns(3)
+        for column, (label, value) in zip(first_row + second_row, metrics):
+            column.metric(label, value)
+
+    with st.container(key="pc_mobile_metrics"):
+        cash_col, summary_col = st.columns([2, 1], vertical_alignment="center")
+        cash_col.metric(*metrics[0])
+        with summary_col:
+            with st.popover("資產摘要", use_container_width=True):
+                for label, value in metrics[1:]:
+                    st.metric(label, value)
+
+    st.markdown('<div class="pc-metrics-spacer" aria-hidden="true"></div>',
+                unsafe_allow_html=True)
+
+
 def commit(worksheet, state, action, **fields):
     """Validate locally, then append. Network uncertainty is reported, never shown as success."""
     draft = clone_state(state)
@@ -321,22 +404,16 @@ def sign_in():
 def render():
     st.set_page_config(page_title="PC Fund Tracker", page_icon="💻", layout="wide")
     sign_in()
-    st.title("💻 PC Fund Tracker")
-    if st.button("登出"):
-        st.session_state.pop("auth_signature", None)
-        st.rerun()
-
     try:
         state, worksheet = load_ledger()
-    except Exception as exc:
-        st.error(f"無法讀取帳本，已停止操作。原因：{exc}")
+    except Exception:
+        st.error("無法讀取帳本，已停止操作。請檢查試算表與 Secrets 設定。")
         st.stop()
 
     prices, portfolio, assets = price_all(state)
     missing = [ticker for ticker, result in prices.items() if result is None]
-    if missing:
-        st.error("無法取得報價：" + "、".join(missing) + "。總市值、總資產與損益暫停計算。")
     day = datetime.now(TZ).date().isoformat()
+    snapshot_failed = False
     if assets is not None:
         desired = {"total_assets": float(assets), "target_price": float(state["target"])}
         if state["snapshots"].get(day) != desired:
@@ -344,40 +421,39 @@ def render():
                 append_event(worksheet, "snapshot", day=day, **{k: str(v) for k, v in desired.items()})
                 state["snapshots"][day] = desired
             except Exception:
-                st.warning("今日走勢快照未儲存；交易紀錄不受影響。")
+                snapshot_failed = True
 
-    cols = st.columns(4)
-    for column, (label, value) in zip(cols, [
-        ("現金餘額", amount_text(state["balance"])),
-        ("股票總市值", amount_text(portfolio) if portfolio is not None else "無法計算"),
-        ("總資產", amount_text(assets) if assets is not None else "無法計算"),
-        ("硬體目標價", amount_text(state["target"])),
-    ]):
-        column.metric(label, value)
+    profit = investment_profit(state, prices) if assets is not None else None
+    render_metric_header(state, portfolio, assets, profit)
+
+    st.title("💻 PC Fund Tracker")
+    if st.button("登出"):
+        st.session_state.pop("auth_signature", None)
+        st.rerun()
+    if missing:
+        st.error("無法取得報價：" + "、".join(missing) + "。股票市值、目前總資產與投資損益暫停計算。")
+    if snapshot_failed:
+        st.warning("今日走勢快照未儲存；交易紀錄不受影響。")
+    st.caption("累計存入本金是有效存款紀錄的總和；提款不會改變歷來存入的金額。")
+
     if state["target"] > 0 and assets is not None:
         st.metric("含現金距離目標", amount_text(state["target"] - assets))
         st.metric("股票市值距離目標", amount_text(state["target"] - portfolio))
         st.progress(min(float(assets / state["target"]), 1.0), text=f"可用資金達成率：{assets / state['target']:.2%}")
 
-    if assets is not None:
-        realized = sum((sale["realized"] for sale in state["sells"]), Decimal("0.00"))
-        unrealized = sum((prices[lot["ticker"]]["price"] * lot["remaining"] - lot["remaining_cost"]
-                          for lot in state["buys"] if lot["remaining"]), Decimal("0.00"))
-        dividends = sum((d["amount"] for d in state["dividends"]), Decimal("0.00"))
-        investment_profit = money(realized + unrealized + dividends)
-        st.metric("投資損益（含股息、交易手續費）", amount_text(investment_profit))
+    if profit is not None:
         history = state["target_history"]
         if len(history) >= 2:
             increase = state["target"] - money(history[0]["price"])
-            st.metric("相對首次記錄的硬體漲幅：投資損益減漲幅", amount_text(investment_profit - increase))
+            st.metric("相對首次記錄的硬體漲幅：投資損益減漲幅", amount_text(profit - increase))
         st.caption("投資損益以買入成本、賣出收入與已登記股息計算；不把新存入的薪水當成獲利。")
 
     if state["snapshots"]:
         chart_rows = []
         for date, values in sorted(state["snapshots"].items()):
             chart_rows.extend([
-                {"日期": date, "指標": "總資產", "金額（NT$）": values["total_assets"]},
-                {"日期": date, "指標": "硬體目標價", "金額（NT$）": values["target_price"]},
+                {"日期": date, "指標": "目前總資產", "金額（NT$）": values["total_assets"]},
+                {"日期": date, "指標": "目標金額", "金額（NT$）": values["target_price"]},
             ])
         st.plotly_chart(px.line(pd.DataFrame(chart_rows), x="日期", y="金額（NT$）",
                                 color="指標", markers=True), use_container_width=True)
