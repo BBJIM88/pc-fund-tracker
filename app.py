@@ -838,6 +838,39 @@ def connect_store(st):
                       baseline_title=st.secrets.get("BASELINE_WORKSHEET_NAME"), client=client)
 
 
+def session_store(st):
+    """Reuse one connection within this authenticated browser session only."""
+    raw = st.secrets.get("GCP_KEY_JSON")
+    credentials = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+    key = digest({"credentials": credentials,
+                  "spreadsheet_id": st.secrets.get("SPREADSHEET_ID"),
+                  "baseline_id": st.secrets.get("BASELINE_WORKSHEET_ID"),
+                  "baseline_title": st.secrets.get("BASELINE_WORKSHEET_NAME")})
+    connection = st.session_state.get("_sheet_connection")
+    if connection is None or connection[0] != key:
+        store = connect_store(st)
+        st.session_state["_sheet_connection"] = (key, store)
+        st.session_state.pop("_display_cache", None)
+        return store
+    return connection[1]
+
+
+def remember_display(st, store, name, value):
+    cache = st.session_state.setdefault("_display_cache", {})
+    cache[name] = (store, time.monotonic(), value)
+    return value
+
+
+def read_display(st, store, name, reader, *, ttl):
+    """Short-lived display cache; write verification must call store.read directly."""
+    cache = st.session_state.setdefault("_display_cache", {})
+    entry = cache.get(name)
+    if entry is not None and entry[0] is store and time.monotonic() - entry[1] < ttl:
+        return entry[2]
+    cache.pop(name, None)
+    return remember_display(st, store, name, reader())
+
+
 def show_failure(st, exc, label="操作失敗"):
     if isinstance(exc, LedgerError):
         st.error(f"{label}：{exc}")
@@ -906,7 +939,8 @@ def render_pending(st, store, ledger):
                    key="write_pending", type="primary"):
         st.session_state["pending_sent"] = True
         try:
-            _, result = write_pending(store, event)
+            checked, result = write_pending(store, event)
+            remember_display(st, store, "ledger", checked)
             if result["status"] == "已入帳":
                 st.session_state.pop("pending_event", None)
                 st.session_state.pop("pending_sent", None)
@@ -1118,7 +1152,8 @@ def render_history(st, store, ledger, prices, assets, parts):
     st.subheader("資產走勢")
     st.caption("快照由你按下按鈕時保存，同日以最後一筆顯示；沒有開啟 App 的日期不會自動補值。")
     try:
-        snapshots, errors = merged_snapshots(ledger, store.read_snapshots())
+        snapshot_rows = read_display(st, store, "snapshots", store.read_snapshots, ttl=60)
+        snapshots, errors = merged_snapshots(ledger, snapshot_rows)
     except Exception as exc:
         show_failure(st, exc, "快照讀取失敗")
         snapshots, errors = {}, []
@@ -1137,6 +1172,7 @@ def render_history(st, store, ledger, prices, assets, parts):
     if st.button("保存今日快照", disabled=assets is None):
         try:
             latest = store.read()
+            remember_display(st, store, "ledger", latest)
             if latest.revision != ledger.revision:
                 raise Conflict("帳本已更新；請重新整理後再保存快照。")
             s = {"id": str(uuid.uuid4()), "day": datetime.now(TZ).date().isoformat(), "recorded_at": now_text(),
@@ -1145,8 +1181,10 @@ def render_history(st, store, ledger, prices, assets, parts):
                  "ledger_revision": ledger.revision, "holdings": holdings(ledger.state),
                  "quotes": {t: {**q, "price": str(q["price"])} for t, q in prices.items()}}
             s["checksum"] = digest(s)
+            st.session_state.get("_display_cache", {}).pop("snapshots", None)
             store.append_snapshot(s)
-            st.success("今日快照已保存。")
+            st.session_state["flash"] = "今日快照已保存。"
+            st.rerun()
         except Exception as exc:
             show_failure(st, exc, "快照未能確認")
 
@@ -1251,8 +1289,11 @@ def render():
     with st.sidebar:
         st.caption("個人股票帳務 · v" + APP_VERSION)
         if st.button("重新整理帳本與行情"):
+            st.session_state.pop("_display_cache", None)
+            st.session_state.pop("_sheet_connection", None)
             st.cache_data.clear()
             st.rerun()
+        st.caption("其他裝置的變更可按重新整理取得；確認寫入時會核對最新帳本。")
         if st.button("登出"):
             if st.session_state.get("pending_sent") and not st.session_state.get("pending_rejected"):
                 st.warning("請先確認待處理操作並保存操作檔案，再登出。")
@@ -1261,8 +1302,8 @@ def render():
                     del st.session_state[key]
                 st.rerun()
     try:
-        store = connect_store(st)
-        ledger = store.read()
+        store = session_store(st)
+        ledger = read_display(st, store, "ledger", store.read, ttl=15)
     except Exception as exc:
         show_failure(st, exc, "帳本無法載入，已停止操作")
         st.caption("若有損壞，先從 Google Sheets 下載原始工作表備份，再依錯誤列號檢查。勿清空 A1 或 Events。")
