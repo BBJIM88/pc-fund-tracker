@@ -732,19 +732,62 @@ def record_login(key, success, at=None, storage=None):
             failures[key] = (count, at + 15 * 60 if count >= 5 else 0)
 
 
-def quote_uncached(ticker):
-    import yfinance as yf
-    try:
-        history = yf.Ticker(ticker).history(period="5d", auto_adjust=False, timeout=10)
-        if history.empty:
-            return None
-        p = float(history["Close"].iloc[-1])
-        if not math.isfinite(p) or p <= 0:
-            return None
-        return {"price": money(p), "at": history.index[-1].isoformat(), "fetched_at": now_text(),
-                "source": "Yahoo Finance 日線最近一筆收盤價"}
-    except Exception:
+def twse_quote(ticker):
+    """Official unadjusted closing price, preserving the actual trading date."""
+    from urllib.parse import urlencode
+    from urllib.request import Request, urlopen
+
+    if not TICKER_PATTERN.fullmatch(ticker) or not ticker.endswith(".TW"):
         return None
+    today = datetime.now(TZ).date()
+    month = today.replace(day=1)
+    previous_month = (month - timedelta(days=1)).replace(day=1)
+    for query_month in (month, previous_month):
+        try:
+            query = urlencode({"response": "json", "stockNo": ticker[:-3],
+                               "date": query_month.strftime("%Y%m%d")})
+            request = Request("https://www.twse.com.tw/exchangeReport/STOCK_DAY?" + query,
+                              headers={"User-Agent": "PCFundTracker/2.0", "Accept": "application/json"})
+            with urlopen(request, timeout=10) as response:
+                payload = json.load(response)
+            if payload.get("stat") != "OK":
+                continue
+            fields = payload.get("fields", [])
+            day_index, close_index = fields.index("日期"), fields.index("收盤價")
+            quotes = []
+            for row in payload.get("data", []):
+                try:
+                    year, mo, day = map(int, str(row[day_index]).split("/"))
+                    trading_day = date(year + 1911 if year < 1911 else year, mo, day)
+                    price = money(str(row[close_index]).replace(",", "").strip())
+                    if price > 0 and timedelta(0) <= today - trading_day <= timedelta(days=45):
+                        quotes.append((trading_day, price))
+                except (ValueError, TypeError, IndexError, InvalidOperation):
+                    continue
+            if quotes:
+                trading_day, price = max(quotes, key=lambda q: q[0])
+                return {"price": price, "at": trading_day.isoformat(), "fetched_at": now_text(),
+                        "source": "臺灣證券交易所 日線最近一筆收盤價"}
+        except Exception as exc:
+            logging.getLogger(__name__).warning("TWSE quote unavailable for %s (%s)",
+                                                ticker, type(exc).__name__)
+    return None
+
+
+def quote_uncached(ticker):
+    try:
+        import yfinance as yf
+        history = yf.Ticker(ticker).history(period="5d", auto_adjust=False, timeout=10)
+        if not history.empty:
+            p = float(history["Close"].iloc[-1])
+            if math.isfinite(p) and p > 0:
+                return {"price": money(p), "at": history.index[-1].isoformat(), "fetched_at": now_text(),
+                        "source": "Yahoo Finance 日線最近一筆收盤價"}
+        logging.getLogger(__name__).warning("Yahoo quote empty or invalid for %s", ticker)
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Yahoo quote unavailable for %s (%s)",
+                                            ticker, type(exc).__name__)
+    return twse_quote(ticker)
 
 
 def sign_in(st):
@@ -928,7 +971,8 @@ def render_overview(st, ledger, prices, parts, market, assets):
         rows.append({"代號": ticker, "股數": shares, "剩餘成本": float(basis), "平均成本": float(basis / shares),
                      "參考收盤價": float(q["price"]) if q else None, "市值": float(value) if value is not None else None,
                      "未實現損益": float(value - basis) if value is not None else None,
-                     "報價日期": trade_day(q["at"]).isoformat() if q else "無法取得"})
+                     "報價日期": trade_day(q["at"]).isoformat() if q else "無法取得",
+                     "行情來源": q.get("source", "未標示") if q else "無法取得"})
     st.subheader("庫存彙總")
     dataframe(st, rows, money_columns=("剩餘成本", "平均成本", "參考收盤價", "市值", "未實現損益"))
     with st.expander("買入批次與 FIFO 成本"):
