@@ -989,8 +989,9 @@ def dataframe(st, rows, *, money_columns=()):
     if not rows:
         st.caption("目前沒有紀錄。")
         return
-    configs = {c: st.column_config.NumberColumn(c, format="NT$ %.2f") for c in money_columns}
-    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", column_config=configs)
+    configs = {c: st.column_config.NumberColumn(c, format="NT$ %.2f", width="medium") for c in money_columns}
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", column_config=configs,
+                 row_height=48, height=min(520, (len(rows) + 1) * 48 + 3))
 
 
 def render_overview(st, ledger, prices, parts, market, assets):
