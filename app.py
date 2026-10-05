@@ -790,6 +790,22 @@ def quote_uncached(ticker):
     return twse_quote(ticker)
 
 
+def style_forms(st):
+    st.markdown("""<style>
+    [data-testid="stForm"] { padding: 1.4rem; border-radius: 16px; }
+    [data-testid="stForm"] [data-baseweb="input"],
+    [data-testid="stForm"] [data-testid="stNumberInputContainer"] {
+        min-height: 48px; border-radius: 10px;
+    }
+    [data-testid="stForm"] input { min-height: 46px; }
+    [data-testid="stForm"] [data-baseweb="textarea"] { border-radius: 10px; }
+    [data-testid="stForm"] textarea { line-height: 1.6; }
+    @media (max-width: 640px) {
+        [data-testid="stForm"] { padding: 1rem; }
+    }
+    </style>""", unsafe_allow_html=True)
+
+
 def sign_in(st):
     password = st.secrets.get("APP_PASSWORD")
     if not isinstance(password, str) or len(password) < 12:
@@ -810,7 +826,7 @@ def sign_in(st):
     if wait:
         st.error(f"登入嘗試過多，請約 {math.ceil(wait / 60)} 分鐘後再試。")
         st.stop()
-    with st.form("login", clear_on_submit=True):
+    with st.form("login", clear_on_submit=True, width=420):
         entered = st.text_input("密碼", type="password")
         submitted = st.form_submit_button("登入")
     if submitted:
@@ -1029,49 +1045,65 @@ def record_fields(st, action, state, *, prefix, initial=None):
     initial = initial or {}
     today = datetime.now(TZ).date()
     default_day = trade_day(initial["date"]) if initial.get("date") else today
-    fields = {"date": st.date_input("交易／實收日期", value=default_day, max_value=today,
-                                    key=prefix + "_day").isoformat()}
+    fields = {}
+    date_column, ticker_column = st.columns(2, gap="medium")
+    with date_column:
+        fields["date"] = st.date_input("交易／實收日期", value=default_day, max_value=today,
+                                      key=prefix + "_day").isoformat()
     if action in {"buy", "sell", "dividend", "split"}:
         historical = sorted({b["ticker"] for b in state["buys"]} | {d.get("ticker", "") for d in state["dividends"]} - {""})
         st.caption("代號含 .TW 或 .TWO。可補登已清倉股票的股息；行情故障不會阻止記帳。")
         if historical:
             st.caption("曾持有：" + "、".join(historical))
-        fields["ticker"] = st.text_input("股票代號", value=initial.get("ticker", "006208.TW"),
-                                          key=prefix + "_ticker").strip().upper()
+        with ticker_column:
+            fields["ticker"] = st.text_input("股票代號", value=initial.get("ticker", "006208.TW"),
+                                            key=prefix + "_ticker").strip().upper()
     if action in {"buy", "sell"}:
-        fields["shares"] = st.number_input("成交股數", min_value=1, value=integer(initial.get("shares", 1)),
-                                            step=1, key=prefix + "_shares")
-        fields["price"] = str(money(st.number_input("成交單價 NT$", min_value=0.01,
+        shares_column, price_column = st.columns(2, gap="medium")
+        with shares_column:
+            fields["shares"] = st.number_input("成交股數", min_value=1, value=integer(initial.get("shares", 1)),
+                                              step=1, key=prefix + "_shares")
+        with price_column:
+            fields["price"] = str(money(st.number_input("成交單價 NT$", min_value=0.01,
                                   value=float(initial.get("price", 1)), step=0.01, format="%.2f", key=prefix + "_price")))
-        fields["fee"] = str(money(st.number_input("手續費 NT$", min_value=0.0,
+        fee_column, tax_column, other_column = st.columns(3, gap="medium")
+        with fee_column:
+            fields["fee"] = str(money(st.number_input("手續費 NT$", min_value=0.0,
                                 value=float(initial.get("fee", 0)), step=1.0, format="%.2f", key=prefix + "_fee")))
-        fields["tax"] = str(money(st.number_input("交易稅 NT$（依券商明細）", min_value=0.0,
+        with tax_column:
+            fields["tax"] = str(money(st.number_input("交易稅 NT$", help="依券商明細填入。", min_value=0.0,
                                 value=float(initial.get("tax", 0)), step=1.0, format="%.2f", key=prefix + "_tax")))
-        fields["other_fee"] = str(money(st.number_input("其他費用 NT$", min_value=0.0,
+        with other_column:
+            fields["other_fee"] = str(money(st.number_input("其他費用 NT$", min_value=0.0,
                                       value=float(initial.get("other_fee", 0)), step=1.0, format="%.2f", key=prefix + "_other")))
         net = money(money(fields["price"]) * fields["shares"] +
                     (1 if action == "buy" else -1) * (money(fields["fee"]) + money(fields["tax"]) + money(fields["other_fee"])))
         st.caption(("應付" if action == "buy" else "實收") + "：" + amount_text(net) + "（提交預覽後再確認）")
     elif action == "split":
-        fields["numerator"] = st.number_input("調整後股數比例", min_value=1,
+        after_column, before_column = st.columns(2, gap="medium")
+        with after_column:
+            fields["numerator"] = st.number_input("調整後股數比例", min_value=1,
                                               value=int(initial.get("numerator", 4)), key=prefix + "_num")
-        fields["denominator"] = st.number_input("調整前股數比例", min_value=1,
+        with before_column:
+            fields["denominator"] = st.number_input("調整前股數比例", min_value=1,
                                                 value=int(initial.get("denominator", 1)), key=prefix + "_den")
         st.caption("例如 1 股變 4 股：後=4、前=1。僅調整股數並保留成本；含現金補償／減資不能套用此操作。")
     else:
         default = initial.get("amount", state["target"] if action == "target" and state["target"] else 1000)
-        fields["amount"] = str(money(st.number_input("實收／支出／目標金額 NT$", min_value=0.01,
+        with ticker_column:
+            fields["amount"] = str(money(st.number_input("實收／支出／目標金額 NT$", min_value=0.01,
                                     value=float(default), step=100.0, format="%.2f", key=prefix + "_amount")))
-    fields["note"] = st.text_input("備註", value=initial.get("note", ""), max_chars=500, key=prefix + "_note")
+    fields["note"] = st.text_area("備註", value=initial.get("note", ""), max_chars=500,
+                                  height=96, placeholder="選填，例如交易用途或補充說明", key=prefix + "_note")
     return fields
 
 
 def render_entry(st, ledger, *, disabled=False):
     st.subheader("登記操作")
     action = st.selectbox("操作類型", ["buy", "sell", "deposit", "withdrawal", "dividend", "target", "split"],
-                           format_func=lambda a: LABELS[a], key="entry_action")
+                           format_func=lambda a: LABELS[a], key="entry_action", width=320)
     st.caption(f"舊帳截止日：{ledger.cutoff if ledger.cutoff != date.min else '尚無舊帳'}。新帳可按交易日期補登；同日依登記順序。")
-    with st.form("entry_" + action):
+    with st.form("entry_" + action, width=760):
         fields = record_fields(st, action, ledger.state, prefix="entry_" + action)
         if st.form_submit_button("預覽此筆操作", type="primary", disabled=disabled):
             stage(st, ledger, action, **fields)
@@ -1079,7 +1111,7 @@ def render_entry(st, ledger, *, disabled=False):
 
 def render_records(st, ledger):
     st.subheader("全部帳務紀錄")
-    search = st.text_input("搜尋代號、備註或 ID", key="record_search").strip().lower()
+    search = st.text_input("搜尋代號、備註或 ID", key="record_search", width=480).strip().lower()
     include_inactive = st.checkbox("包含已撤銷／舊版刪除", value=True)
     rows = []
     for item in ledger.records:
@@ -1110,16 +1142,17 @@ def render_amend(st, ledger, *, disabled=False):
     if not options:
         st.caption("沒有可更正的紀錄。")
         return
-    selected = st.selectbox("選擇紀錄", options, key="amend_selection", format_func=lambda r:
+    selected = st.selectbox("選擇紀錄", options, key="amend_selection", width=760, format_func=lambda r:
                             f"{(r['effective'] or r['original']).get('date', '')[:10]} · "
                             f"{LABELS[r['original']['action']]} · {(r['effective'] or r['original']).get('ticker', '')} · "
                             f"{r['status']} · {r['id'][-8:]}")
     mode = st.radio("處理方式", ["更正內容", "撤銷紀錄", "復原原始內容"], horizontal=True, key="amend_mode")
     st.caption("更正會重算後續現金、庫存與賣出成本；若出現不足，會拒絕執行。歷史行情快照不會自動改寫。")
-    with st.form("amend_" + selected["id"] + mode):
+    with st.form("amend_" + selected["id"] + mode, width=760):
         initial = selected["effective"] or selected["original"]
         fields = record_fields(st, initial["action"], ledger.state, prefix="amend_" + selected["id"], initial=initial) if mode == "更正內容" else None
-        reason = st.text_input("更正／撤銷／復原原因", max_chars=500, key="amend_reason_" + selected["id"])
+        reason = st.text_area("更正／撤銷／復原原因", max_chars=500, height=96,
+                              key="amend_reason_" + selected["id"])
         if st.form_submit_button("重算並預覽影響", disabled=disabled):
             replacement = ({**fields, "action": initial["action"], "recorded_at": initial.get("recorded_at", "")}
                            if fields else None if mode == "撤銷紀錄" else selected["original"])
@@ -1249,7 +1282,7 @@ def render_data(st, store, ledger):
                 preview = validate_backup(content)
                 st.success(f"備份回放通過：帳面現金 {amount_text(preview.state['balance'])}，有效事件 {len(preview.accepted)} 筆。")
                 st.json(holdings(preview.state))
-                target_id = st.text_input("另一份空白試算表 ID", key="restore_target")
+                target_id = st.text_input("另一份空白試算表 ID", key="restore_target", width=600)
                 confirmed = st.checkbox("我已保存目前帳本備份，目的地是專供還原的空白試算表。")
                 if st.button("還原至該空白試算表", disabled=not confirmed or not target_id.strip()):
                     target_spreadsheet = store.client.open_by_key(target_id.strip())
@@ -1284,6 +1317,7 @@ def render_data(st, store, ledger):
 def render():
     import streamlit as st
     st.set_page_config(page_title="PC Fund Tracker", page_icon="💻", layout="wide")
+    style_forms(st)
     sign_in(st)
     st.title("💻 PC Fund Tracker")
     with st.sidebar:
