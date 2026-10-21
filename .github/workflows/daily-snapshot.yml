@@ -1,0 +1,40 @@
+name: 每日資產快照
+
+on:
+  schedule:
+    # Taipei 18:17 (UTC+8), including weekends and market holidays.
+    - cron: "17 10 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: daily-asset-snapshot
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 取得程式
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: 設定 Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-snapshot.txt
+      - name: 安裝排程所需套件
+        run: python -m pip install --disable-pip-version-check -r requirements-snapshot.txt
+      - name: 保存今日快照
+        env:
+          GCP_KEY_JSON: ${{ secrets.GCP_KEY_JSON }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          BASELINE_WORKSHEET_ID: ${{ vars.BASELINE_WORKSHEET_ID }}
+          BASELINE_WORKSHEET_NAME: ${{ vars.BASELINE_WORKSHEET_NAME }}
+          PYTHONUNBUFFERED: "1"
+        run: python snapshot_job.py

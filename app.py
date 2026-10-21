@@ -25,7 +25,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.2.0"
 SHEET_NAME = "PC_Fund_Tracker"
 EVENTS_NAME = "Events"
 SNAPSHOTS_NAME = "Snapshots_v2"
@@ -1342,37 +1342,205 @@ def render_amend(st, ledger, *, disabled=False):
             stage(st, ledger, "amend", target_id=selected["id"], replacement=replacement, reason=reason)
 
 
-def merged_snapshots(ledger, rows):
-    snapshots = {day: {**values, "day": day, "legacy": True} for day, values in ledger.state["snapshots"].items()}
-    errors = []
+def snapshot_datetime(value=None):
+    try:
+        captured = datetime.now(TZ) if value is None else value
+        if isinstance(captured, str):
+            captured = datetime.fromisoformat(captured.replace("Z", "+00:00"))
+        if not isinstance(captured, datetime):
+            raise ValueError()
+        if captured.tzinfo is None:
+            captured = captured.replace(tzinfo=TZ)
+        return captured.astimezone(TZ)
+    except (ValueError, TypeError) as exc:
+        raise LedgerError("快照時間格式無效。") from exc
+
+
+def snapshot_order(snapshot):
+    day = trade_day(snapshot["day"])
+    captured = (snapshot_datetime(snapshot["recorded_at"]) if snapshot.get("recorded_at")
+                else datetime.combine(day, datetime.min.time(), tzinfo=TZ))
+    return day, captured
+
+
+def parse_snapshots(rows):
+    records, errors = [], []
     for i, row in enumerate(rows, 1):
         if not row or not row[0]:
             continue
         try:
-            s = json.loads(row[0])
-            if s.get("checksum") != digest({k: v for k, v in s.items() if k != "checksum"}):
+            snapshot = json.loads(row[0])
+            if not isinstance(snapshot, dict) or snapshot.get("checksum") != digest(
+                    {k: v for k, v in snapshot.items() if k != "checksum"}):
                 raise LedgerError("校驗失敗")
-            day = trade_day(s["day"]).isoformat()
-            money(s["total_assets"])
-            money(s["target_price"])
-            if "net_principal" in s:
-                money(s["net_principal"])
-            snapshots[day] = s
+            snapshot_order(snapshot)
+            money(snapshot["total_assets"])
+            money(snapshot["target_price"])
+            if "net_principal" in snapshot:
+                money(snapshot["net_principal"])
+            records.append(snapshot)
         except (ValueError, KeyError, TypeError):
             errors.append(i)
+    return records, errors
+
+
+def merged_snapshots(ledger, rows):
+    snapshots = {day: {**values, "day": day, "legacy": True} for day, values in ledger.state["snapshots"].items()}
+    records, errors = parse_snapshots(rows)
+    for snapshot in records:
+        day = trade_day(snapshot["day"]).isoformat()
+        previous = snapshots.get(day)
+        if previous is None or previous.get("legacy") or snapshot_order(snapshot) >= snapshot_order(previous):
+            snapshots[day] = snapshot
     return snapshots, errors
 
 
-def render_history(st, store, ledger, prices, assets, parts):
+def build_daily_snapshot(ledger, prices, *, source="app", recorded_at=None):
+    captured = snapshot_datetime(recorded_at)
+    positions = holdings(ledger.state)
+    quotes, validated_prices = {}, {}
+    for ticker in positions:
+        result = prices.get(ticker)
+        if not isinstance(result, dict):
+            raise LedgerError("報價不完整，保留原有快照。")
+        try:
+            price = money(result["price"])
+            if price <= 0 or trade_day(result["at"]) > captured.date():
+                raise ValueError()
+        except (KeyError, ValueError, TypeError) as exc:
+            raise LedgerError("報價無效，保留原有快照。") from exc
+        quotes[ticker] = {"price": str(price), "at": str(result["at"]),
+                          "source": str(result.get("source", "未標示"))}
+        validated_prices[ticker] = {**result, "price": price}
+    market, assets = valuation(ledger.state, validated_prices)
+    parts = profit_parts(ledger.state, validated_prices)
+    snapshot = {"id": str(uuid.uuid4()), "day": captured.date().isoformat(),
+                "recorded_at": captured.isoformat(timespec="microseconds"), "source": source,
+                "total_assets": str(assets), "cash_balance": str(ledger.state["balance"]),
+                "market_value": str(market), "target_price": str(ledger.state["target"]),
+                "net_principal": str(net_principal(ledger.state)), "profit": str(parts["total"]),
+                "ledger_revision": ledger.revision, "holdings": positions, "quotes": quotes}
+    snapshot["checksum"] = digest(snapshot)
+    return snapshot
+
+
+def snapshot_signature(snapshot):
+    return digest({key: value for key, value in snapshot.items()
+                   if key not in {"id", "recorded_at", "source", "checksum"}})
+
+
+def save_daily_snapshot(store, ledger, prices, *, source="app", recorded_at=None,
+                        snapshot_rows=None, force=False):
+    snapshot = build_daily_snapshot(ledger, prices, source=source, recorded_at=recorded_at)
+
+    def duplicate(rows):
+        latest = merged_snapshots(ledger, rows)[0].get(snapshot["day"])
+        return (latest if latest and not force and snapshot_signature(latest) == snapshot_signature(snapshot)
+                and (source != "github_actions" or latest.get("source") == "github_actions") else None)
+
+    if snapshot_rows is not None:
+        same = duplicate(snapshot_rows)
+        if same:
+            return {"snapshot": same, "written": False, "rows": snapshot_rows, "reason": "unchanged"}
+    # Cached display data may skip a duplicate, but must never authorize a write.
+    rows = store.read_snapshots()
+    same = duplicate(rows)
+    if same:
+        return {"snapshot": same, "written": False, "rows": rows, "reason": "unchanged"}
+    latest = store.read()
+    if latest.revision != ledger.revision:
+        raise Conflict("帳本已更新；請重新取得帳本與報價後再保存快照。")
+    try:
+        store.append_snapshot(snapshot)
+    except Exception:
+        # A timeout can still mean the server stored it. Reconcile this exact ID.
+        try:
+            checked_rows = store.read_snapshots()
+            checked = next((item for item in parse_snapshots(checked_rows)[0]
+                            if item.get("id") == snapshot["id"] and item.get("checksum") == snapshot["checksum"]), None)
+            if checked:
+                return {"snapshot": checked, "written": True, "rows": checked_rows, "reason": "confirmed"}
+        except Exception:
+            pass
+        raise WriteUncertain("快照寫入結果尚未確認；保留原紀錄，請稍後重新整理查詢。")
+    try:
+        checked_rows = store.read_snapshots()
+        if not any(item.get("id") == snapshot["id"] and item.get("checksum") == snapshot["checksum"]
+                   for item in parse_snapshots(checked_rows)[0]):
+            raise WriteUncertain("尚未讀到本次快照，請稍後重新整理查詢。")
+    except WriteUncertain:
+        raise
+    except Exception as exc:
+        raise WriteUncertain("已送出快照，但尚未確認保存結果；請稍後重新整理查詢。") from exc
+    return {"snapshot": snapshot, "written": True, "rows": checked_rows, "reason": "saved"}
+
+
+def snapshot_health(ledger, rows, *, at=None):
+    today = snapshot_datetime(at).date()
+    snapshots, _ = merged_snapshots(ledger, rows)
+    latest = max(snapshots.values(), key=snapshot_order, default=None)
+    records, _ = parse_snapshots(rows)
+    background = max((s for s in records if s.get("source") == "github_actions"),
+                     key=snapshot_order, default=None)
+    return {"latest": latest, "age_days": (today - trade_day(latest["day"])).days if latest else None,
+            "background": background,
+            "background_age_days": (today - trade_day(background["day"])).days if background else None}
+
+
+def render_history(st, store, ledger, prices, assets, parts, *, pending=False):
     import pandas as pd
     st.subheader("資產走勢")
-    st.caption("快照由你按下按鈕時保存，同日以最後一筆顯示；沒有開啟 App 的日期不會自動補值。")
+    st.caption("每日首次開啟、帳務或行情變更後會自動保存；同一天顯示最新快照。背景每日排程啟用後，app 休眠時也能記錄。")
     try:
         snapshot_rows = read_display(st, store, "snapshots", store.read_snapshots, ttl=60)
         snapshots, errors = merged_snapshots(ledger, snapshot_rows)
     except Exception as exc:
         show_failure(st, exc, "快照讀取失敗")
-        snapshots, errors = {}, []
+        snapshot_rows = None
+        snapshots, errors = merged_snapshots(ledger, [])
+    book_id = store.spreadsheet.id
+    today = datetime.now(TZ).date().isoformat()
+    notice_key = f"snapshot_gap_{book_id}_{today}"
+    if snapshot_rows is not None:
+        before = snapshot_health(ledger, snapshot_rows)
+        if before["age_days"] is not None and before["age_days"] > 2:
+            st.session_state.setdefault(notice_key, before["latest"]["day"])
+        if assets is not None and not pending:
+            attempt = (ledger.revision, today)
+            try:
+                attempt = snapshot_signature(build_daily_snapshot(ledger, prices))
+                blocked = st.session_state.get("snapshot_write_backoff")
+                if not blocked or blocked[0] != (book_id, attempt) or time.monotonic() - blocked[1] >= 60:
+                    result = save_daily_snapshot(store, ledger, prices, snapshot_rows=snapshot_rows)
+                    snapshot_rows = result["rows"]
+                    remember_display(st, store, "snapshots", snapshot_rows)
+                    snapshots, errors = merged_snapshots(ledger, snapshot_rows)
+                    st.session_state.pop("snapshot_write_backoff", None)
+                else:
+                    st.warning("今日快照尚未自動保存；原有快照仍保留。請稍後重新整理或按下方按鈕重試。")
+            except Exception as exc:
+                st.session_state["snapshot_write_backoff"] = ((book_id, attempt), time.monotonic())
+                LOG.warning("Automatic snapshot unavailable (%s)", type(exc).__name__)
+                st.warning("今日快照尚未自動保存；原有快照仍保留。請稍後重新整理或按下方按鈕重試。")
+        elif assets is None:
+            st.caption("目前報價不完整，暫不保存新快照；已保存的歷史資料保持原值。")
+    health = snapshot_health(ledger, snapshot_rows or [])
+    latest = health["latest"]
+    updated = (snapshot_datetime(latest["recorded_at"]).strftime("%Y/%m/%d %H:%M:%S")
+               if latest and latest.get("recorded_at") else latest["day"] + "（舊版未記錄時間）" if latest else "尚無紀錄")
+    st.metric("最新資產快照時間", updated)
+    if health["background"]:
+        background = health["background"]
+        background_time = (snapshot_datetime(background["recorded_at"]).strftime("%Y/%m/%d %H:%M:%S")
+                           if background.get("recorded_at") else background["day"] + "（未記錄時間）")
+        st.caption("背景排程最後成功：" + background_time + "（台灣時間）")
+        if health["background_age_days"] > 2:
+            st.warning(f"背景排程已 {health['background_age_days']} 天沒有成功紀錄，請到 GitHub Actions 檢查每日快照排程。")
+    else:
+        st.caption("每日背景排程：尚未收到成功紀錄；完成 GitHub Actions 設定後會在此顯示時間。")
+    if st.session_state.get(notice_key):
+        st.warning("開啟時最新快照停在 " + st.session_state[notice_key]
+                   + "，已超過兩天未更新。今天的快照會另存，中間缺漏日期不會自動倒填；請檢查背景排程。")
     if errors:
         st.warning("部分快照損壞，未納入圖表。列號：" + ", ".join(map(str, errors)))
     if snapshots:
@@ -1385,20 +1553,10 @@ def render_history(st, store, ledger, prices, assets, parts):
         mismatch = [d for d, s in snapshots.items() if not s.get("legacy") and s.get("ledger_revision") != ledger.revision]
         if mismatch:
             st.caption("過去快照保留當時數值；之後存提款、交易或更正都可能讓帳本版本不同。")
-    if st.button("保存今日快照", disabled=assets is None):
+    if st.button("保存今日快照", disabled=assets is None or pending):
         try:
-            latest = store.read()
-            remember_display(st, store, "ledger", latest)
-            if latest.revision != ledger.revision:
-                raise Conflict("帳本已更新；請重新整理後再保存快照。")
-            s = {"id": str(uuid.uuid4()), "day": datetime.now(TZ).date().isoformat(), "recorded_at": now_text(),
-                 "total_assets": str(assets), "target_price": str(ledger.state["target"]),
-                 "net_principal": str(net_principal(ledger.state)), "profit": str(parts["total"]),
-                 "ledger_revision": ledger.revision, "holdings": holdings(ledger.state),
-                 "quotes": {t: {**q, "price": str(q["price"])} for t, q in prices.items()}}
-            s["checksum"] = digest(s)
-            st.session_state.get("_display_cache", {}).pop("snapshots", None)
-            store.append_snapshot(s)
+            result = save_daily_snapshot(store, ledger, prices, source="manual", force=True)
+            remember_display(st, store, "snapshots", result["rows"])
             st.session_state["flash"] = "今日快照已保存。"
             st.rerun()
         except Exception as exc:
@@ -1558,7 +1716,7 @@ def render():
             st.caption("請先處理上方待確認操作。")
         render_amend(st, ledger, disabled=pending)
     with tabs[4]:
-        render_history(st, store, ledger, prices, assets, parts)
+        render_history(st, store, ledger, prices, assets, parts, pending=pending)
     with tabs[5]:
         render_data(st, store, ledger)
 
