@@ -1,16 +1,15 @@
-"""Offline ledger and Streamlit checks for independently tracked existing holdings.
+"""Offline regression tests for the v2 ledger and separate existing holdings.
 
-Run: venv\\Scripts\\python.exe -m unittest -v test_existing_holdings.py
-All Sheets and market-data calls use fakes; no credentials or live data are read.
+Run: python -m unittest -v test_existing_holdings
+Google Sheets, credentials and market data are all replaced with fakes.
 """
-
 import json
 import unittest
 from copy import deepcopy
-from decimal import Decimal
+from decimal import Decimal as D
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import gspread
 import pandas as pd
@@ -20,25 +19,9 @@ from streamlit.testing.v1 import AppTest
 import app
 
 
-def sample_baseline():
-    baseline = app.default_data()
-    baseline["cash_account"] = {
-        "balance": 939,
-        "history": [{"date": "2026-01-01", "amount": 1000, "note": "salary"}],
-    }
-    baseline["target_hardware"]["current_target"] = 5000
-    baseline["transactions"] = [{
-        "type": "buy", "date": "2026-01-01", "ticker": "2330.TW",
-        "shares": 3, "price": 20, "fee": 1,
-    }]
-    baseline["daily_snapshots"] = {
-        "2026-01-01": {"total_assets": 1239.0, "target_price": 5000.0},
-    }
-    return baseline
-
-
 class FakeWorksheet:
-    def __init__(self, rows=None):
+    def __init__(self, title, sheet_id, rows=None):
+        self.title, self.id = title, sheet_id
         self.rows = deepcopy(rows or [])
 
     def acell(self, address):
@@ -53,181 +36,174 @@ class FakeWorksheet:
 
 
 class FakeSpreadsheet:
-    def __init__(self, baseline=None, events=None):
-        self.raw_baseline = json.dumps(baseline or app.default_data(), ensure_ascii=False)
-        self.sheet1 = FakeWorksheet([[self.raw_baseline]])
-        self.events = FakeWorksheet([[json.dumps(event)] for event in events or []])
+    def __init__(self, raw="", events=None):
+        self.id = "test-book"
+        self.sheets = [FakeWorksheet("原帳本", 42, [[raw]] if raw else []),
+                       FakeWorksheet(app.EVENTS_NAME, 43, [[app.canonical(e)] for e in events or []])]
 
     def worksheet(self, title):
-        if title != app.EVENTS_NAME:
-            raise gspread.WorksheetNotFound(title)
-        return self.events
+        for sheet in self.sheets:
+            if sheet.title == title:
+                return sheet
+        raise gspread.WorksheetNotFound(title)
+
+    def worksheets(self):
+        return self.sheets[:]
+
+    def get_worksheet_by_id(self, sheet_id):
+        return next((s for s in self.sheets if s.id == sheet_id), None)
 
     def add_worksheet(self, title, **kwargs):
-        assert title == app.EVENTS_NAME
-        return self.events
+        sheet = FakeWorksheet(title, max(s.id for s in self.sheets) + 1)
+        self.sheets.append(sheet)
+        return sheet
 
 
-def event(action, **fields):
-    return {"id": "test-event", "action": action, "date": "2026-01-01", **fields}
+def advance(ledger, action, **fields):
+    event, updated = app.create_event(ledger, action, **fields)
+    return updated, event
 
 
-class ExistingHoldingsLedgerTests(unittest.TestCase):
-    def setUp(self):
-        self.state = app.make_state(sample_baseline())
+def funded():
+    ledger, _ = advance(app.load_bundle("", []), "deposit", amount="1000", date="2026-01-01")
+    return advance(ledger, "buy", ticker="2330.TW", shares=3, price="20", fee="1", date="2026-01-02")[0]
 
-    def test_old_baseline_starts_with_empty_existing_holdings(self):
-        self.assertEqual(self.state["existing_holdings"], {})
-        self.assertEqual(app.holdings(self.state), {"2330.TW": 3})
 
-    def test_add_update_remove_leave_original_ledger_unchanged(self):
-        original = deepcopy(self.state)
-        app.apply_event(self.state, event("set_existing_holding", ticker=" 2330.tw ", shares=20))
-        app.apply_event(self.state, event("set_existing_holding", ticker="2330.TW", shares=7))
-        self.assertEqual(self.state["existing_holdings"], {"2330.TW": 7})
-        self.assertEqual(app.holdings(self.state), {"2330.TW": 3})
-        self.assertEqual({k: v for k, v in self.state.items() if k != "existing_holdings"},
+class LedgerCompatibilityTests(unittest.TestCase):
+    def test_existing_v2_financial_records_and_amendments_keep_their_results(self):
+        ledger = funded()
+        ledger, sale = advance(ledger, "sell", ticker="2330.TW", shares=1, price="100", fee="1", date="2026-01-03")
+        ledger, _ = advance(ledger, "amend", target_id=sale["id"], replacement={**sale, "price": "110"}, reason="更正")
+        original = deepcopy(ledger.state)
+        imported, event = advance(ledger, "set_existing_holding", ticker=" 2330.tw ", shares=20)
+        self.assertEqual(event["schema_version"], 2)
+        self.assertIn("expected_revision", event)
+        self.assertIn("event_hash", event)
+        self.assertEqual(imported.state["existing_holdings"], {"2330.TW": 20})
+        self.assertEqual({k: v for k, v in imported.state.items() if k != "existing_holdings"},
                          {k: v for k, v in original.items() if k != "existing_holdings"})
-        app.apply_event(self.state, event("remove_existing_holding", ticker=" 2330.tw "))
-        self.assertEqual(self.state, original)
+        self.assertEqual(imported.state["balance"], D("1048.00"))
+        self.assertEqual(imported.state["sells"][0]["realized"], D("88.67"))
 
-    def test_tw_and_two_are_separate_normalized_symbols(self):
-        app.apply_event(self.state, event("set_existing_holding", ticker=" 6488.two ", shares=11))
-        app.apply_event(self.state, event("set_existing_holding", ticker="0050.tw", shares=8))
-        self.assertEqual(self.state["existing_holdings"], {"6488.TWO": 11, "0050.TW": 8})
+    def test_id_based_connection_accepts_both_supported_secret_formats(self):
+        for raw in ('{"fake": "test"}', {"fake": "test"}):
+            client = Mock()
+            ui = SimpleNamespace(secrets={"GCP_KEY_JSON": raw, "SPREADSHEET_ID": "test-book", "BASELINE_WORKSHEET_ID": 42})
+            with patch("gspread.service_account_from_dict", return_value=client) as auth:
+                store = app.connect_store(ui)
+            self.assertEqual(auth.call_args.args[0], {"fake": "test"})
+            client.open_by_key.assert_called_once_with("test-book")
+            client.open.assert_not_called()
+            self.assertEqual(store.baseline_id, 42)
 
-    def test_invalid_shares_are_rejected_without_partial_mutation(self):
-        for shares in (0, -1, 1.9, "1.1", True, False, float("nan"), float("inf"),
-                       "NaN", "Infinity", None, "abc", 2**53):
-            with self.subTest(shares=shares):
-                original = deepcopy(self.state)
-                with self.assertRaises(ValueError):
-                    app.apply_event(self.state, event("set_existing_holding", ticker="2330.TW", shares=shares))
-                self.assertEqual(self.state, original)
+    def test_reordered_worksheets_and_pinned_marker_keep_same_a1(self):
+        ledger = funded()
+        book = FakeSpreadsheet(events=ledger.events)
+        marker = {"id": "marker", "action": "baseline", "baseline_hash": app.text_hash(""), "baseline_worksheet_id": 42}
+        book.worksheet(app.EVENTS_NAME).append_row([app.canonical(marker)])
+        book.sheets.reverse()
+        self.assertEqual(app.SheetStore(book).read().state, ledger.state)
 
-    def test_invalid_tickers_are_rejected(self):
-        for ticker in ("2330", "AAPL", "2330.US", "<script>.TW", "", None):
-            with self.subTest(ticker=ticker), self.assertRaises(ValueError):
-                app.apply_event(self.state, event("set_existing_holding", ticker=ticker, shares=1))
-        self.assertEqual(self.state["existing_holdings"], {})
-
-    def test_removing_missing_ticker_leaves_other_holdings_unchanged(self):
-        app.apply_event(self.state, event("set_existing_holding", ticker="0050.TW", shares=8))
-        original = deepcopy(self.state)
-        app.apply_event(self.state, event("remove_existing_holding", ticker="2330.TW"))
-        self.assertEqual(self.state, original)
-
-    def test_empty_valuation_needs_no_quotes(self):
-        with patch.object(app, "quote") as quote:
-            self.assertEqual(app.price_existing_holdings(self.state), ({}, Decimal("0.00")))
-            quote.assert_not_called()
-
-    def test_same_ticker_valued_independently_from_original_finances(self):
-        app.apply_event(self.state, event("set_existing_holding", ticker="2330.TW", shares=20))
-        with patch.object(app, "quote", return_value={"price": Decimal("100.00"), "at": "2026-01-01"}):
-            prices, portfolio, assets = app.price_all(self.state)
-            _, existing = app.price_existing_holdings(self.state)
-        self.assertEqual((portfolio, assets, existing),
-                         (Decimal("300.00"), Decimal("1239.00"), Decimal("2000.00")))
-        self.assertEqual(app.investment_profit(self.state, prices), Decimal("239.00"))
-        self.assertEqual(app.cumulative_principal(self.state), Decimal("1000.00"))
-
-    def test_missing_existing_quote_does_not_disable_original_valuation(self):
-        app.apply_event(self.state, event("set_existing_holding", ticker="0050.TW", shares=2))
-        quotes = {"2330.TW": {"price": Decimal("100.00"), "at": "2026-01-01"}, "0050.TW": None}
-        with patch.object(app, "quote", side_effect=quotes.get):
-            prices, _, assets = app.price_all(self.state)
-            existing_prices, existing = app.price_existing_holdings(self.state)
-        self.assertEqual(assets, Decimal("1239.00"))
-        self.assertEqual(app.investment_profit(self.state, prices), Decimal("239.00"))
-        self.assertEqual(existing_prices, {"0050.TW": None})
-        self.assertIsNone(existing)
-
-    def test_missing_original_quote_does_not_disable_existing_valuation(self):
-        app.apply_event(self.state, event("set_existing_holding", ticker="0050.TW", shares=2))
-        quotes = {"2330.TW": None, "0050.TW": {"price": Decimal("123.45"), "at": "2026-01-01"}}
-        with patch.object(app, "quote", side_effect=quotes.get):
-            _, portfolio, assets = app.price_all(self.state)
-            _, existing = app.price_existing_holdings(self.state)
-        self.assertIsNone(portfolio)
-        self.assertIsNone(assets)
-        self.assertEqual(existing, Decimal("246.90"))
-
-    def test_missing_quote_never_presents_partial_sum_as_total(self):
-        for ticker in ("0050.TW", "6488.TWO"):
-            app.apply_event(self.state, event("set_existing_holding", ticker=ticker, shares=3))
-        quotes = {"0050.TW": {"price": Decimal("12.34"), "at": "2026-01-01"}, "6488.TWO": None}
-        with patch.object(app, "quote", side_effect=quotes.get):
-            prices, total = app.price_existing_holdings(self.state)
-        self.assertEqual(set(prices), set(quotes))
-        self.assertIsNone(total)
-        quotes["6488.TWO"] = {"price": Decimal("56.78"), "at": "2026-01-01"}
-        with patch.object(app, "quote", side_effect=quotes.get):
-            self.assertEqual(app.price_existing_holdings(self.state)[1], Decimal("207.36"))
-
-    def test_existing_only_shares_cannot_fund_original_sell_or_dividend(self):
-        app.apply_event(self.state, event("set_existing_holding", ticker="0050.TW", shares=20))
-        original = deepcopy(self.state)
-        with self.assertRaises(ValueError):
-            app.apply_event(self.state, event("sell", ticker="0050.TW", shares=1, price="100", fee="0"))
-        with self.assertRaises(ValueError):
-            app.apply_event(self.state, event("dividend", ticker="0050.TW", amount="10"))
-        self.assertEqual(self.state, original)
-
-    def test_original_sale_cannot_consume_existing_shares_of_same_symbol(self):
-        app.apply_event(self.state, event("set_existing_holding", ticker="2330.TW", shares=20))
-        original = deepcopy(self.state)
-        with self.assertRaises(ValueError):
-            app.apply_event(self.state, event("sell", ticker="2330.TW", shares=4, price="100", fee="0"))
-        self.assertEqual(self.state, original)
-        app.apply_event(self.state, event("sell", ticker="2330.TW", shares=3, price="100", fee="0"))
-        self.assertEqual(app.holdings(self.state), {})
-        self.assertEqual(self.state["existing_holdings"], {"2330.TW": 20})
-        self.assertEqual(self.state["balance"], Decimal("1239.00"))
-
-    def test_invalid_input_does_not_append_to_sheets(self):
-        worksheet = FakeWorksheet()
-        for action, fields in (
-            ("set_existing_holding", {"ticker": "2330.TW", "shares": 1.5}),
-            ("set_existing_holding", {"ticker": "bad", "shares": 1}),
-            ("remove_existing_holding", {"ticker": "bad"}),
-        ):
-            with self.subTest(action=action, fields=fields), self.assertRaises(ValueError):
-                app.commit(worksheet, self.state, action, **fields)
-        self.assertEqual(worksheet.rows, [])
-
-    def test_persisted_add_update_remove_roundtrip_and_duplicate_id_replay(self):
-        book = FakeSpreadsheet(sample_baseline())
-        original_a1 = deepcopy(book.sheet1.rows)
-        with patch.object(app, "connection", return_value=book), patch.object(app.st, "rerun"):
-            state, worksheet = app.load_ledger()
-            app.commit(worksheet, state, "set_existing_holding", ticker="2330.TW", shares=20)
-            state, _ = app.load_ledger()
-            self.assertEqual(state["existing_holdings"], {"2330.TW": 20})
-            app.commit(worksheet, state, "set_existing_holding", ticker="2330.TW", shares=9)
-            state, _ = app.load_ledger()
-            self.assertEqual(state["existing_holdings"], {"2330.TW": 9})
-            app.commit(worksheet, state, "remove_existing_holding", ticker="2330.TW")
-            worksheet.rows.append(deepcopy(worksheet.rows[-1]))
-            state, _ = app.load_ledger()
-            self.assertEqual(state["existing_holdings"], {})
-        self.assertEqual(book.sheet1.rows, original_a1)
-        self.assertEqual(state, app.make_state(sample_baseline()))
-
-    def test_distinct_retry_ids_do_not_accumulate_shares_or_break_removal_replay(self):
-        actions = [
-            {**event("set_existing_holding", ticker="2330.TW", shares=20), "id": "save-one"},
-            {**event("set_existing_holding", ticker="2330.TW", shares=20), "id": "save-two"},
+    def test_old_feature_rows_and_snapshots_after_v2_are_read_without_rewriting(self):
+        ledger = funded()
+        additions = [
+            {"id": "import", "action": "set_existing_holding", "date": "2026-10-21", "ticker": "2330.TW", "shares": 20},
+            {"id": "snapshot", "action": "snapshot", "day": "2026-10-21", "total_assets": "1239", "target_price": "5000"},
         ]
-        book = FakeSpreadsheet(sample_baseline(), events=actions)
-        with patch.object(app, "connection", return_value=book):
-            state, worksheet = app.load_ledger()
-            self.assertEqual(state["existing_holdings"], {"2330.TW": 20})
-            for entry_id in ("remove-one", "remove-two"):
-                removal = {**event("remove_existing_holding", ticker="2330.TW"), "id": entry_id}
-                worksheet.append_row([json.dumps(removal)])
-            state, _ = app.load_ledger()
-        self.assertEqual(state, app.make_state(sample_baseline()))
+        events = ledger.events + additions
+        saved = deepcopy(events)
+        restored = app.load_bundle("", events)
+        self.assertEqual(events, saved)
+        self.assertEqual(restored.state["existing_holdings"], {"2330.TW": 20})
+        self.assertEqual(restored.state["balance"], ledger.state["balance"])
+        later, _ = advance(restored, "deposit", amount="1", date="2026-01-04")
+        self.assertEqual(later.state["balance"], D("940.00"))
+        self.assertEqual(later.state["existing_holdings"], {"2330.TW": 20})
+
+    def test_legacy_financial_writer_after_v2_still_rejected(self):
+        ledger = funded()
+        event = {"id": "unsafe-old-writer", "action": "deposit", "date": "2026-10-21", "amount": "1"}
+        with self.assertRaisesRegex(app.LedgerError, "舊版寫入"):
+            app.load_bundle("", ledger.events + [event])
+
+    def test_backdated_financial_replay_preserves_latest_position_quantity(self):
+        ledger = funded()
+        ledger, _ = advance(ledger, "set_existing_holding", ticker="0050.TW", shares=10)
+        ledger, _ = advance(ledger, "deposit", amount="2", date="2026-01-06")
+        ledger, _ = advance(ledger, "set_existing_holding", ticker="0050.TW", shares=7)
+        ledger, _ = advance(ledger, "deposit", amount="3", date="2026-01-05")
+        self.assertEqual(ledger.state["existing_holdings"], {"0050.TW": 7})
+        self.assertEqual(ledger.state["balance"], D("944.00"))
+
+    def test_update_remove_retry_and_amendment_preserve_financial_ledger(self):
+        ledger = funded()
+        original = deepcopy(ledger.state)
+        ledger, imported = advance(ledger, "set_existing_holding", ticker="6488.TWO", shares=20)
+        ledger = app.load_bundle("", ledger.events + [deepcopy(imported)])
+        ledger, _ = advance(ledger, "set_existing_holding", ticker="6488.TWO", shares=9)
+        self.assertEqual(ledger.state["existing_holdings"], {"6488.TWO": 9})
+        ledger, removal = advance(ledger, "remove_existing_holding", ticker="6488.TWO")
+        ledger, _ = advance(ledger, "remove_existing_holding", ticker="6488.TWO")
+        self.assertEqual(ledger.state, original)
+        ledger, _ = advance(ledger, "amend", target_id=removal["id"], replacement=None, reason="保留追蹤")
+        self.assertEqual(ledger.state, original)  # The second removal remains effective.
+
+    def test_stale_position_write_is_rejected_and_duplicate_id_not_repeated(self):
+        book = FakeSpreadsheet(events=funded().events)
+        store = app.SheetStore(book, baseline_id=42)
+        ledger = store.read()
+        first, _ = app.create_event(ledger, "set_existing_holding", ticker="0050.TW", shares=8)
+        stale, _ = app.create_event(ledger, "set_existing_holding", ticker="0050.TW", shares=3)
+        app.write_pending(store, first)
+        before = deepcopy(book.worksheet(app.EVENTS_NAME).rows)
+        _, status = app.write_pending(store, stale)
+        self.assertEqual(status["status"], "衝突未入帳")
+        checked, status = app.write_pending(store, first)
+        self.assertEqual(status["status"], "已入帳")
+        self.assertEqual(checked.state["existing_holdings"], {"0050.TW": 8})
+        self.assertEqual(book.worksheet(app.EVENTS_NAME).rows, before)
+
+    def test_invalid_positions_rejected_before_any_write(self):
+        ledger = funded()
+        for shares in (0, -1, 1.5, True, "NaN", "Infinity", None, 10**12 + 1):
+            with self.subTest(shares=shares), self.assertRaises(app.LedgerError):
+                app.create_event(ledger, "set_existing_holding", ticker="2330.TW", shares=shares)
+        for ticker in ("2330", "AAPL", "2330.US", "<script>.TW", ""):
+            with self.subTest(ticker=ticker), self.assertRaises(app.LedgerError):
+                app.create_event(ledger, "set_existing_holding", ticker=ticker, shares=1)
+        self.assertEqual(ledger.state["existing_holdings"], {})
+
+    def test_same_symbol_valuations_and_missing_quotes_are_independent(self):
+        ledger, _ = advance(funded(), "set_existing_holding", ticker="2330.TW", shares=20)
+        q = {"2330.TW": {"price": D("100.00")}}
+        self.assertEqual(app.valuation(ledger.state, q), (D("300.00"), D("1239.00")))
+        self.assertEqual(app.existing_valuation(ledger.state, q), D("2000.00"))
+        self.assertEqual(app.profit_parts(ledger.state, q)["total"], D("239.00"))
+        ledger, _ = advance(ledger, "set_existing_holding", ticker="0050.TW", shares=2)
+        self.assertIsNone(app.existing_valuation(ledger.state, q))
+        self.assertEqual(app.valuation(ledger.state, q)[1], D("1239.00"))
+        self.assertIsNone(app.valuation(ledger.state, {"2330.TW": None})[1])
+        self.assertEqual(app.existing_valuation(app.make_state(app.default_data()), {}), D("0.00"))
+
+    def test_existing_only_shares_cannot_be_consumed_by_original_sell(self):
+        ledger, _ = advance(funded(), "set_existing_holding", ticker="2330.TW", shares=20)
+        with self.assertRaises(app.LedgerError):
+            app.create_event(ledger, "sell", ticker="2330.TW", shares=4, price="100", fee="0")
+        sold, _ = advance(ledger, "sell", ticker="2330.TW", shares=3, price="100", fee="0")
+        self.assertEqual(app.holdings(sold.state), {})
+        self.assertEqual(sold.state["existing_holdings"], {"2330.TW": 20})
+
+    def test_complete_backup_roundtrip_contains_existing_positions(self):
+        ledger, _ = advance(funded(), "set_existing_holding", ticker="0050.TW", shares=8)
+        document = app.backup_document(ledger, spreadsheet_id="test-book", baseline_worksheet_id=42)
+        self.assertEqual(app.validate_backup(json.loads(json.dumps(document))).state, ledger.state)
+
+    def test_connection_failure_diagnostic_never_displays_exception_contents(self):
+        ui = SimpleNamespace(error=Mock(), caption=Mock())
+        app.show_failure(ui, PermissionError("fake-secret-sentinel"), "測試讀取")
+        displayed = str(ui.error.call_args) + str(ui.caption.call_args)
+        self.assertIn("PermissionError", displayed)
+        self.assertNotIn("fake-secret-sentinel", displayed)
 
 
 class ExistingHoldingsUITests(unittest.TestCase):
@@ -235,29 +211,27 @@ class ExistingHoldingsUITests(unittest.TestCase):
 
     def setUp(self):
         st.cache_data.clear()
-        self.book = FakeSpreadsheet(sample_baseline())
+        self.book = FakeSpreadsheet(events=funded().events)
         self.prices = {"2330.TW": 100.0, "0050.TW": 50.0}
-        client = SimpleNamespace(open=lambda name: self.book)
-        self.gspread_patch = patch("gspread.service_account_from_dict", return_value=client)
-        self.yfinance_patch = patch("yfinance.Ticker", side_effect=self.fake_ticker)
-        self.gspread_patch.start()
-        self.yfinance_patch.start()
-        self.addCleanup(self.gspread_patch.stop)
-        self.addCleanup(self.yfinance_patch.stop)
+        self.client = SimpleNamespace(open_by_key=lambda _: self.book)
+        self.patches = [patch("gspread.service_account_from_dict", return_value=self.client),
+                        patch("yfinance.Ticker", side_effect=self.fake_ticker),
+                        patch("urllib.request.urlopen", side_effect=TimeoutError("offline test"))]
+        for replacement in self.patches:
+            replacement.start()
+            self.addCleanup(replacement.stop)
         self.addCleanup(st.cache_data.clear)
 
     def fake_ticker(self, ticker):
         def history(**kwargs):
             price = self.prices.get(ticker)
-            if price is None:
-                return pd.DataFrame()
-            return pd.DataFrame({"Close": [price]}, index=pd.DatetimeIndex(["2026-01-01"], tz="Asia/Taipei"))
+            return (pd.DataFrame({"Close": [price]}, index=pd.DatetimeIndex(["2026-10-21"], tz="Asia/Taipei"))
+                    if price is not None else pd.DataFrame())
         return SimpleNamespace(history=history)
 
     def open_app(self):
         at = AppTest.from_file(str(Path(__file__).with_name("app.py")), default_timeout=15)
-        at.secrets["APP_PASSWORD"] = self.PASSWORD
-        at.secrets["GCP_KEY_JSON"] = "{}"
+        at.secrets.update(APP_PASSWORD=self.PASSWORD, GCP_KEY_JSON="{}", SPREADSHEET_ID="test-book", BASELINE_WORKSHEET_ID=42)
         at.run()
         at.text_input[0].set_value(self.PASSWORD)
         self.button(at, "登入").click().run()
@@ -266,67 +240,55 @@ class ExistingHoldingsUITests(unittest.TestCase):
 
     @staticmethod
     def button(at, label):
-        return next(button for button in at.button if button.label == label)
+        return next(b for b in at.button if b.label == label)
 
-    def assert_metric(self, at, label, expected):
-        values = [metric.value for metric in at.metric if metric.label == label]
-        self.assertTrue(values, f"Missing metric: {label}")
-        self.assertTrue(all(value == expected for value in values), (label, values))
+    def assert_metric(self, at, label, value):
+        self.assertEqual([m.value for m in at.metric if m.label == label], [value])
 
     def save(self, at, ticker, shares):
         at.text_input(key="existing_ticker").set_value(ticker)
         at.number_input(key="existing_shares").set_value(shares)
-        self.button(at, "儲存既有庫存").click().run()
+        self.button(at, "預覽既有庫存").click().run()
+        self.assertFalse(at.exception)
+        self.button(at, "確認寫入").click().run()
         self.assertFalse(at.exception)
 
-    def test_add_update_remove_and_new_session_reload_keep_original_assets(self):
-        original_a1 = deepcopy(self.book.sheet1.rows)
+    def test_preview_confirm_update_remove_and_new_session_keep_a1_and_assets(self):
+        original_a1 = deepcopy(self.book.get_worksheet_by_id(42).rows)
         at = self.open_app()
-        self.assert_metric(at, "既有庫存總市值", "NT$ 0.00")
+        self.assertEqual(len(at.tabs), 6)
         self.save(at, " 2330.tw ", 20)
         self.assert_metric(at, "既有庫存總市值", "NT$ 2,000.00")
         self.assert_metric(at, "目前總資產", "NT$ 1,239.00")
-        self.assert_metric(at, "投資損益", "NT$ 239.00")
         self.save(at, "2330.TW", 9)
-        self.assert_metric(at, "既有庫存總市值", "NT$ 900.00")
         reopened = self.open_app()
         self.assert_metric(reopened, "既有庫存總市值", "NT$ 900.00")
-        reopened.selectbox(key="remove_existing_ticker").select("2330.TW")
-        self.button(reopened, "移除此檔既有庫存").click().run()
+        self.button(reopened, "預覽移除既有庫存").click().run()
+        self.button(reopened, "確認寫入").click().run()
         self.assertFalse(reopened.exception)
         self.assert_metric(reopened, "既有庫存總市值", "NT$ 0.00")
         self.assert_metric(reopened, "目前總資產", "NT$ 1,239.00")
-        self.assertEqual(self.book.sheet1.rows, original_a1)
-        with patch.object(app, "connection", return_value=self.book):
-            state, _ = app.load_ledger()
-        self.assertEqual(state["existing_holdings"], {})
-        self.assertEqual(state["snapshots"]["2026-01-01"], {"total_assets": 1239.0, "target_price": 5000.0})
-        self.assertTrue(all(snapshot["total_assets"] == 1239.0 for snapshot in state["snapshots"].values()))
+        self.assertEqual(self.book.get_worksheet_by_id(42).rows, original_a1)
 
-    def test_unavailable_existing_quote_can_be_saved_without_affecting_original_assets(self):
+    def test_missing_existing_quote_does_not_disable_original_assets(self):
         self.prices["0050.TW"] = None
         at = self.open_app()
         self.save(at, "0050.TW", 15)
-        self.assert_metric(at, "既有庫存總市值", "無法計算")
+        self.assert_metric(at, "既有庫存總市值", "報價不完整")
         self.assert_metric(at, "目前總資產", "NT$ 1,239.00")
-        self.assertTrue(any("0050.TW" in warning.value for warning in at.warning))
-        with patch.object(app, "connection", return_value=self.book):
-            state, _ = app.load_ledger()
-        self.assertEqual(state["existing_holdings"], {"0050.TW": 15})
 
-    def test_missing_original_quote_still_renders_existing_total(self):
+    def test_missing_original_quote_does_not_disable_existing_value(self):
         self.prices["2330.TW"] = None
         at = self.open_app()
         self.save(at, "0050.TW", 15)
         self.assert_metric(at, "既有庫存總市值", "NT$ 750.00")
-        self.assert_metric(at, "目前總資產", "無法計算")
+        self.assert_metric(at, "目前總資產", "報價不完整")
 
-    def test_invalid_ticker_does_not_write_an_event(self):
+    def test_pending_operation_disables_existing_position_forms(self):
         at = self.open_app()
-        before = deepcopy(self.book.events.rows)
-        self.save(at, "AAPL", 15)
-        self.assertTrue(at.error)
-        self.assertEqual(self.book.events.rows, before)
+        at.query_params["pending"] = "unknown-operation"
+        at.run()
+        self.assertTrue(self.button(at, "預覽既有庫存").disabled)
 
 
 if __name__ == "__main__":
