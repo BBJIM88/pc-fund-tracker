@@ -1,5 +1,5 @@
 # Versions used for the Streamlit UI and adapter regression tests.
-streamlit==1.50.0
+streamlit==1.64.0
 gspread==6.2.1
 pandas==2.3.3
 yfinance==0.2.66

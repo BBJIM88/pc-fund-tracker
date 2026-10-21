@@ -11,6 +11,7 @@ import csv
 import hashlib
 import hmac
 import io
+import inspect
 import json
 import logging
 import math
@@ -24,7 +25,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 SHEET_NAME = "PC_Fund_Tracker"
 EVENTS_NAME = "Events"
 SNAPSHOTS_NAME = "Snapshots_v2"
@@ -823,6 +824,97 @@ def quote_uncached(ticker):
     return twse_quote(ticker)
 
 
+MOBILE_KEYBOARD_HTML = """
+<script>
+(() => {
+  const installed = window.__pcFundMobileKeyboards;
+  if (installed) { installed.refresh(); return; }
+  const rules = [
+    ['[class*="st-key-pc_numeric_ticker_"] input[type="text"]', 'numeric'],
+    ['[class*="st-key-pc_integer_"] input[type="number"]', 'numeric'],
+    ['[class*="st-key-pc_decimal_"] input[type="number"]', 'decimal']
+  ];
+  const apply = (root) => {
+    for (const [selector, mode] of rules) {
+      const inputs = [];
+      if (root.matches?.(selector)) inputs.push(root);
+      if (root.querySelectorAll) inputs.push(...root.querySelectorAll(selector));
+      for (const input of inputs) {
+        if (input.getAttribute('inputmode') !== mode) input.setAttribute('inputmode', mode);
+      }
+    }
+  };
+  const beforeFocus = (event) => apply(event.target);
+  document.addEventListener('pointerdown', beforeFocus, true);
+  document.addEventListener('focusin', beforeFocus, true);
+  const observer = new MutationObserver((changes) => {
+    for (const change of changes) {
+      if (change.type === 'attributes') apply(change.target);
+      for (const node of change.addedNodes) apply(node);
+    }
+  });
+  observer.observe(document.documentElement, {
+    childList: true, subtree: true, attributes: true, attributeFilter: ['inputmode']
+  });
+  window.__pcFundMobileKeyboards = { refresh: () => apply(document) };
+  apply(document);
+})();
+</script>
+"""
+
+
+def enable_mobile_keyboards(st):
+    # Only trusted static code changes keyboard hints on explicitly marked
+    # widgets. Native Streamlit still owns every value, validation and submit.
+    # Older deployments keep working until requirements.txt is updated.
+    if "unsafe_allow_javascript" in inspect.signature(st.html).parameters:
+        st.html(MOBILE_KEYBOARD_HTML, unsafe_allow_javascript=True)
+
+
+def numeric_input(st, label, **kwargs):
+    kind = "integer" if isinstance(kwargs.get("value"), int) else "decimal"
+    with st.container(key=f"pc_{kind}_{kwargs['key']}"):
+        return st.number_input(label, **kwargs)
+
+
+def ticker_input_parts(value):
+    text = value.strip().upper()
+    symbol, separator, market = text.rpartition(".")
+    if not separator:
+        symbol, market = text, "TW"
+    match = re.fullmatch(r"([0-9]+)([A-Z]*)", symbol)
+    return (match.group(1), market, match.group(2)) if match else (symbol, market, "")
+
+
+def assemble_ticker(code, market, suffix=""):
+    code, suffix = code.strip().upper(), suffix.strip().upper()
+    if not code:
+        return ""
+    # A complete pasted symbol wins over stale market/suffix form values.
+    if "." in code:
+        return code
+    if re.search(r"[A-Z]", code):
+        suffix = ""
+    return code + suffix + "." + market
+
+
+def ticker_input(st, label, *, value, key):
+    code, market, suffix = ticker_input_parts(value)
+    code_column, market_column = st.columns([2, 1], gap="medium")
+    with code_column:
+        with st.container(key="pc_numeric_ticker_" + key):
+            code = st.text_input(label, value=code, placeholder="例如 006208 或 2330",
+                                 max_chars=16, autocomplete="off", key=key)
+    with market_column:
+        market = st.selectbox("市場", ["TW", "TWO"], index=1 if market == "TWO" else 0,
+                              format_func=lambda item: "上市（.TW）" if item == "TW" else "上櫃（.TWO）",
+                              key=key + "_market")
+    with st.expander("代碼含英文字尾（例如 00937B）", expanded=bool(suffix)):
+        suffix = st.text_input("英文字尾（選填，例如 B）", value=suffix, max_chars=8,
+                               autocomplete="off", key=key + "_suffix")
+    return assemble_ticker(code, market, suffix)
+
+
 def style_forms(st):
     st.markdown("""<style>
     [data-testid="stForm"] { padding: 1.4rem; border-radius: 16px; }
@@ -1105,9 +1197,8 @@ def render_existing_holdings(st, ledger, quote, *, disabled=False):
         st.caption("未登記買入成本，因此不計算既有庫存損益。日後股數改變時，直接更新目前總股數。")
         with st.expander("新增、更新或移除既有庫存", expanded=not positions):
             with st.form("existing_holding", width=760):
-                ticker = st.text_input("既有股票代號", placeholder="例如 2330.TW 或 6488.TWO",
-                                       max_chars=20, key="existing_ticker").strip().upper()
-                shares = st.number_input("目前持有股數", min_value=1, max_value=10**12,
+                ticker = ticker_input(st, "既有股票代碼", value="", key="existing_ticker")
+                shares = numeric_input(st, "目前持有股數", min_value=1, max_value=10**12,
                                          value=1000, step=1, key="existing_shares")
                 st.caption("1 張 = 1,000 股。同一代號再次儲存會更新為指定的總股數，不會累加。")
                 if st.form_submit_button("預覽既有庫存", disabled=disabled):
@@ -1133,10 +1224,10 @@ def record_fields(st, action, state, *, prefix, initial=None):
                                       key=prefix + "_day").isoformat()
     if action in POSITION_ACTIONS:
         with ticker_column:
-            fields["ticker"] = st.text_input("既有股票代號", value=initial.get("ticker", "006208.TW"),
-                                            key=prefix + "_ticker").strip().upper()
+            fields["ticker"] = ticker_input(st, "既有股票代碼", value=initial.get("ticker", "006208.TW"),
+                                            key=prefix + "_ticker")
         if action == "set_existing_holding":
-            fields["shares"] = st.number_input("目前持有股數", min_value=1, max_value=10**12,
+            fields["shares"] = numeric_input(st, "目前持有股數", min_value=1, max_value=10**12,
                                               value=integer(initial.get("shares", 1000)),
                                               step=1, key=prefix + "_shares")
         fields["note"] = st.text_area("備註", value=initial.get("note", ""), max_chars=500,
@@ -1144,29 +1235,29 @@ def record_fields(st, action, state, *, prefix, initial=None):
         return fields
     if action in {"buy", "sell", "dividend", "split"}:
         historical = sorted({b["ticker"] for b in state["buys"]} | {d.get("ticker", "") for d in state["dividends"]} - {""})
-        st.caption("代號含 .TW 或 .TWO。可補登已清倉股票的股息；行情故障不會阻止記帳。")
+        st.caption("股票代碼可只填數字，市場由選單選擇；也可貼上完整代號。可補登已清倉股票的股息。")
         if historical:
             st.caption("曾持有：" + "、".join(historical))
         with ticker_column:
-            fields["ticker"] = st.text_input("股票代號", value=initial.get("ticker", "006208.TW"),
-                                            key=prefix + "_ticker").strip().upper()
+            fields["ticker"] = ticker_input(st, "股票代碼", value=initial.get("ticker", "006208.TW"),
+                                            key=prefix + "_ticker")
     if action in {"buy", "sell"}:
         shares_column, price_column = st.columns(2, gap="medium")
         with shares_column:
-            fields["shares"] = st.number_input("成交股數", min_value=1, value=integer(initial.get("shares", 1)),
+            fields["shares"] = numeric_input(st, "成交股數", min_value=1, value=integer(initial.get("shares", 1)),
                                               step=1, key=prefix + "_shares")
         with price_column:
-            fields["price"] = str(money(st.number_input("成交單價 NT$", min_value=0.01,
+            fields["price"] = str(money(numeric_input(st, "成交單價 NT$", min_value=0.01,
                                   value=float(initial.get("price", 1)), step=0.01, format="%.2f", key=prefix + "_price")))
         fee_column, tax_column, other_column = st.columns(3, gap="medium")
         with fee_column:
-            fields["fee"] = str(money(st.number_input("手續費 NT$", min_value=0.0,
+            fields["fee"] = str(money(numeric_input(st, "手續費 NT$", min_value=0.0,
                                 value=float(initial.get("fee", 0)), step=1.0, format="%.2f", key=prefix + "_fee")))
         with tax_column:
-            fields["tax"] = str(money(st.number_input("交易稅 NT$", help="依券商明細填入。", min_value=0.0,
+            fields["tax"] = str(money(numeric_input(st, "交易稅 NT$", help="依券商明細填入。", min_value=0.0,
                                 value=float(initial.get("tax", 0)), step=1.0, format="%.2f", key=prefix + "_tax")))
         with other_column:
-            fields["other_fee"] = str(money(st.number_input("其他費用 NT$", min_value=0.0,
+            fields["other_fee"] = str(money(numeric_input(st, "其他費用 NT$", min_value=0.0,
                                       value=float(initial.get("other_fee", 0)), step=1.0, format="%.2f", key=prefix + "_other")))
         net = money(money(fields["price"]) * fields["shares"] +
                     (1 if action == "buy" else -1) * (money(fields["fee"]) + money(fields["tax"]) + money(fields["other_fee"])))
@@ -1174,16 +1265,16 @@ def record_fields(st, action, state, *, prefix, initial=None):
     elif action == "split":
         after_column, before_column = st.columns(2, gap="medium")
         with after_column:
-            fields["numerator"] = st.number_input("調整後股數比例", min_value=1,
+            fields["numerator"] = numeric_input(st, "調整後股數比例", min_value=1,
                                               value=int(initial.get("numerator", 4)), key=prefix + "_num")
         with before_column:
-            fields["denominator"] = st.number_input("調整前股數比例", min_value=1,
+            fields["denominator"] = numeric_input(st, "調整前股數比例", min_value=1,
                                                 value=int(initial.get("denominator", 1)), key=prefix + "_den")
         st.caption("例如 1 股變 4 股：後=4、前=1。僅調整股數並保留成本；含現金補償／減資不能套用此操作。")
     else:
         default = initial.get("amount", state["target"] if action == "target" and state["target"] else 1000)
         with ticker_column:
-            fields["amount"] = str(money(st.number_input("實收／支出／目標金額 NT$", min_value=0.01,
+            fields["amount"] = str(money(numeric_input(st, "實收／支出／目標金額 NT$", min_value=0.01,
                                     value=float(default), step=100.0, format="%.2f", key=prefix + "_amount")))
     fields["note"] = st.text_area("備註", value=initial.get("note", ""), max_chars=500,
                                   height=96, placeholder="選填，例如交易用途或補充說明", key=prefix + "_note")
@@ -1411,6 +1502,7 @@ def render():
     st.set_page_config(page_title="PC Fund Tracker", page_icon="💻", layout="wide")
     style_forms(st)
     sign_in(st)
+    enable_mobile_keyboards(st)
     st.title("💻 PC Fund Tracker")
     with st.sidebar:
         st.caption("個人股票帳務 · v" + APP_VERSION)
