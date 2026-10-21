@@ -34,6 +34,9 @@ class FakeWorksheet:
     def append_row(self, row, **kwargs):
         self.rows.append(deepcopy(row))
 
+    def append_rows(self, rows, **kwargs):
+        self.rows.extend(deepcopy(rows))
+
 
 class FakeSpreadsheet:
     def __init__(self, raw="", events=None):
@@ -216,6 +219,7 @@ class ExistingHoldingsUITests(unittest.TestCase):
         self.client = SimpleNamespace(open_by_key=lambda _: self.book)
         self.patches = [patch("gspread.service_account_from_dict", return_value=self.client),
                         patch("yfinance.Ticker", side_effect=self.fake_ticker),
+                        patch("historical_prices.load_history", new=lambda *args: {"quotes": {}, "coverage": []}),
                         patch("urllib.request.urlopen", side_effect=TimeoutError("offline test"))]
         for replacement in self.patches:
             replacement.start()

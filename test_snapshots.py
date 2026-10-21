@@ -256,7 +256,7 @@ class SnapshotUITests(unittest.TestCase):
         at = self.open_app()
         self.assertEqual(len(self.rows()), 2)
         self.assertTrue(any("背景排程已" in w.value for w in at.warning))
-        self.assertTrue(any("中間缺漏日期不會自動倒填" in w.value for w in at.warning))
+        self.assertTrue(any("缺漏日期會依可還原的帳本" in c.value for c in at.caption))
         at.run()
         self.assertTrue(any("背景排程已" in w.value for w in at.warning))
 

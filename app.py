@@ -25,7 +25,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.3.0"
 SHEET_NAME = "PC_Fund_Tracker"
 EVENTS_NAME = "Events"
 SNAPSHOTS_NAME = "Snapshots_v2"
@@ -682,6 +682,12 @@ class SheetStore:
     def append_snapshot(self, snapshot):
         self.worksheet(SNAPSHOTS_NAME, create=True).append_row([canonical(snapshot)], value_input_option="RAW",
                                                              insert_data_option="INSERT_ROWS")
+
+    def append_snapshots(self, snapshots):
+        if snapshots:
+            self.worksheet(SNAPSHOTS_NAME, create=True).append_rows(
+                [[canonical(snapshot)] for snapshot in snapshots], value_input_option="RAW",
+                insert_data_option="INSERT_ROWS")
 
 
 def write_pending(store, event):
@@ -1375,7 +1381,8 @@ def parse_snapshots(rows):
                 raise LedgerError("校驗失敗")
             snapshot_order(snapshot)
             money(snapshot["total_assets"])
-            money(snapshot["target_price"])
+            if snapshot.get("source") != "historical_backfill" or "target_price" in snapshot:
+                money(snapshot["target_price"])
             if "net_principal" in snapshot:
                 money(snapshot["net_principal"])
             records.append(snapshot)
@@ -1384,14 +1391,43 @@ def parse_snapshots(rows):
     return records, errors
 
 
+def historical_state_fingerprint(state):
+    return digest({"cash": str(state["balance"]), "holdings": holdings(state),
+                   "target": str(state["target"]) if state["target"] is not None else None,
+                   "principal": str(net_principal(state)),
+                   "cost": str(sum((lot["remaining_cost"] for lot in state["buys"]), money(0))),
+                   "realized": str(sum((sale["realized"] for sale in state["sells"]), money(0))),
+                   "dividends": str(sum((item["amount"] for item in state["dividends"]), money(0))),
+                   "splits": [{"ticker": item["ticker"], "date": trade_day(item["date"]).isoformat(),
+                               "numerator": integer(item["numerator"]), "denominator": integer(item["denominator"])}
+                              for item in state["splits"]]})
+
+
 def merged_snapshots(ledger, rows):
     snapshots = {day: {**values, "day": day, "legacy": True} for day, values in ledger.state["snapshots"].items()}
     records, errors = parse_snapshots(rows)
     for snapshot in records:
         day = trade_day(snapshot["day"]).isoformat()
         previous = snapshots.get(day)
-        if previous is None or previous.get("legacy") or snapshot_order(snapshot) >= snapshot_order(previous):
+        rank = int(snapshot.get("source") != "historical_backfill")
+        previous_rank = int(previous.get("source") != "historical_backfill") if previous else -1
+        if (rank > previous_rank or rank == previous_rank and
+                (previous.get("legacy") or snapshot_order(snapshot) >= snapshot_order(previous))):
             snapshots[day] = snapshot
+    # Corrections can change a past day's state or remove its safe starting point.
+    # Keep old reconstruction rows for audit, but only show valid valuations.
+    historical = {trade_day(day): snapshot for day, snapshot in snapshots.items()
+                  if snapshot.get("source") == "historical_backfill"}
+    stale = {day for day, snapshot in historical.items() if snapshot.get("ledger_revision") != ledger.revision}
+    if stale:
+        from historical_ledger import reconstruct_states
+        states = reconstruct_states(ledger, min(stale), max(stale), days=stale)
+        for day in stale:
+            if day not in states or historical[day].get("state_fingerprint") != historical_state_fingerprint(states[day]):
+                snapshots.pop(day.isoformat(), None)
+    for day, snapshot in historical.items():
+        if snapshot.get("reconstruction_version") != 1:
+            snapshots.pop(day.isoformat(), None)
     return snapshots, errors
 
 
@@ -1487,10 +1523,60 @@ def snapshot_health(ledger, rows, *, at=None):
             "background_age_days": (today - trade_day(background["day"])).days if background else None}
 
 
+def render_backfill(st, store, ledger, snapshot_rows, *, pending=False):
+    from history_backfill import backfill_missing_days, plan_backfill
+    from historical_prices import load_history
+    requested = st.button("補算缺漏日期", disabled=pending)
+    if pending:
+        st.caption("待確認的帳務處理完畢後，才會補算歷史資料。")
+        return snapshot_rows
+    key = (store.spreadsheet.id, ledger.revision, datetime.now(TZ).date().isoformat())
+    attempt = st.session_state.get("history_backfill_attempt")
+    retry = attempt and attempt[0] == key and attempt[2].get("retry") and time.monotonic() - attempt[1] >= 60
+    if requested or not attempt or attempt[0] != key or retry:
+        try:
+            plan = plan_backfill(ledger, snapshot_rows)
+            if plan["states"]:
+                loader = st.cache_data(ttl=60, max_entries=128, show_spinner=False)(load_history)
+                cursor = st.session_state.get("history_backfill_cursor")
+                offset = cursor[1] if cursor and cursor[0] == store.spreadsheet.id else 0
+                with st.spinner("正在取得歷史收盤價並補算缺漏日期…"):
+                    result = backfill_missing_days(store, ledger, history_loader=loader, ticker_offset=offset)
+                st.session_state["history_backfill_cursor"] = (store.spreadsheet.id, result["next_offset"])
+                snapshot_rows = result["rows"]
+                remember_display(st, store, "snapshots", snapshot_rows)
+            else:
+                result = {"written": 0, "unavailable": 0, "remaining": plan["remaining"]}
+            result = {key: result[key] for key in ("written", "unavailable", "remaining")}
+            result["retry"] = bool(result["unavailable"])
+        except Exception as exc:
+            LOG.warning("Historical backfill unavailable (%s)", type(exc).__name__)
+            result = {"retry": True, "error": True}
+            # A timed-out batch may already have stored part of its rows.
+            try:
+                snapshot_rows = store.read_snapshots()
+                remember_display(st, store, "snapshots", snapshot_rows)
+            except Exception:
+                pass
+        attempt = (key, time.monotonic(), result)
+        st.session_state["history_backfill_attempt"] = attempt
+    result = attempt[2]
+    if result.get("error"):
+        st.warning("歷史補算暫未完成；原有快照仍保留，可稍後按「補算缺漏日期」重試。")
+    else:
+        if result.get("written"):
+            st.success(f"已保存 {result['written']} 天的歷史補算資料。")
+        if result.get("unavailable"):
+            st.warning(f"本次有 {result['unavailable']} 天尚未補齊（行情不足或處理時間上限），可稍後重試。")
+        if result.get("remaining"):
+            st.caption(f"還有 {result['remaining']} 天待補算；每次處理最多 90 個日曆日的範圍，可再按「補算缺漏日期」繼續。")
+    return snapshot_rows
+
+
 def render_history(st, store, ledger, prices, assets, parts, *, pending=False):
     import pandas as pd
     st.subheader("資產走勢")
-    st.caption("每日首次開啟、帳務或行情變更後會自動保存；同一天顯示最新快照。背景每日排程啟用後，app 休眠時也能記錄。")
+    st.caption("開啟時自動補算缺漏日期；今日帳務或行情變更後保存當日快照。同一天顯示最新資料，背景每日排程可搭配使用。")
     try:
         snapshot_rows = read_display(st, store, "snapshots", store.read_snapshots, ttl=60)
         snapshots, errors = merged_snapshots(ledger, snapshot_rows)
@@ -1524,11 +1610,14 @@ def render_history(st, store, ledger, prices, assets, parts, *, pending=False):
                 st.warning("今日快照尚未自動保存；原有快照仍保留。請稍後重新整理或按下方按鈕重試。")
         elif assets is None:
             st.caption("目前報價不完整，暫不保存新快照；已保存的歷史資料保持原值。")
+        snapshot_rows = render_backfill(st, store, ledger, snapshot_rows, pending=pending)
+        snapshots, errors = merged_snapshots(ledger, snapshot_rows)
     health = snapshot_health(ledger, snapshot_rows or [])
     latest = health["latest"]
     updated = (snapshot_datetime(latest["recorded_at"]).strftime("%Y/%m/%d %H:%M:%S")
                if latest and latest.get("recorded_at") else latest["day"] + "（舊版未記錄時間）" if latest else "尚無紀錄")
     st.metric("最新資產快照時間", updated)
+    st.caption("最新資料日期：" + latest["day"] if latest else "最新資料日期：尚無紀錄")
     if health["background"]:
         background = health["background"]
         background_time = (snapshot_datetime(background["recorded_at"]).strftime("%Y/%m/%d %H:%M:%S")
@@ -1537,10 +1626,10 @@ def render_history(st, store, ledger, prices, assets, parts, *, pending=False):
         if health["background_age_days"] > 2:
             st.warning(f"背景排程已 {health['background_age_days']} 天沒有成功紀錄，請到 GitHub Actions 檢查每日快照排程。")
     else:
-        st.caption("每日背景排程：尚未收到成功紀錄；完成 GitHub Actions 設定後會在此顯示時間。")
+        st.caption("背景每日排程：尚未收到成功紀錄；開啟時自動補算也可獨立使用。")
     if st.session_state.get(notice_key):
-        st.warning("開啟時最新快照停在 " + st.session_state[notice_key]
-                   + "，已超過兩天未更新。今天的快照會另存，中間缺漏日期不會自動倒填；請檢查背景排程。")
+        st.caption("本次開啟前，最新資料停在 " + st.session_state[notice_key]
+                   + "；缺漏日期會依可還原的帳本與歷史行情補算，補齊情況請看上方提示。")
     if errors:
         st.warning("部分快照損壞，未納入圖表。列號：" + ", ".join(map(str, errors)))
     if snapshots:
@@ -1548,8 +1637,16 @@ def render_history(st, store, ledger, prices, assets, parts, *, pending=False):
         for day, s in sorted(snapshots.items()):
             rows.append({"日期": date.fromisoformat(day), "總資產": float(money(s["total_assets"])),
                          "淨投入": float(money(s["net_principal"])) if "net_principal" in s else None,
-                         "目標": float(money(s["target_price"]))})
+                         "目標": float(money(s["target_price"])) if "target_price" in s else None})
         st.line_chart(pd.DataFrame(rows).set_index("日期"))
+        reconstructed = sum(s.get("source") == "historical_backfill" for s in snapshots.values())
+        if reconstructed:
+            st.caption(f"含 {reconstructed} 天「歷史補算」：依目前已登記／更正的交易與當日官方收盤價重建。實際快照保留當時數值；無法確認的歷史目標留空。")
+        with st.expander("查看每日資料來源"):
+            sources = {"app": "開啟／操作後保存", "manual": "手動快照", "github_actions": "背景排程", "historical_backfill": "歷史補算"}
+            st.dataframe(pd.DataFrame([{"日期": day, "來源": sources.get(s.get("source"), "舊版快照"),
+                                        "保存時間": s.get("recorded_at", "未記錄")}
+                                       for day, s in sorted(snapshots.items(), reverse=True)]), hide_index=True)
         mismatch = [d for d, s in snapshots.items() if not s.get("legacy") and s.get("ledger_revision") != ledger.revision]
         if mismatch:
             st.caption("過去快照保留當時數值；之後存提款、交易或更正都可能讓帳本版本不同。")
