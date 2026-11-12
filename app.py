@@ -25,13 +25,18 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
-APP_VERSION = "2.3.0"
+APP_VERSION = "2.4.0"
 SHEET_NAME = "PC_Fund_Tracker"
 EVENTS_NAME = "Events"
 SNAPSHOTS_NAME = "Snapshots_v2"
 TZ = ZoneInfo("Asia/Taipei")
 CENT = Decimal("0.01")
 TICKER_PATTERN = re.compile(r"^[0-9A-Z]{4,8}\.(TW|TWO)$")
+US_TICKER_PATTERN = re.compile(r"^[A-Z][A-Z0-9]{0,5}(?:[.-][A-Z]{1,2})?$")
+US_SHARE_SCALE = 12
+US_SHARE_UNIT = Decimal("1e-12")
+# v3 protects US records from being silently skipped by the old Taiwan-only app.
+MODERN_SCHEMAS = {2, 3}
 POSITION_ACTIONS = {"set_existing_holding", "remove_existing_holding"}
 BUSINESS_ACTIONS = {"deposit", "withdrawal", "buy", "sell", "dividend", "target", "split"} | POSITION_ACTIONS
 LABELS = {"deposit": "存入", "withdrawal": "提款", "buy": "買入", "sell": "賣出",
@@ -75,11 +80,90 @@ def integer(value, label="股數"):
         raise LedgerError(f"{label}必須是大於零的整數。") from exc
 
 
+def is_us_ticker(value):
+    ticker = value.strip().upper() if isinstance(value, str) else ""
+    return not ticker.endswith((".TW", ".TWO")) and bool(US_TICKER_PATTERN.fullmatch(ticker))
+
+
 def ticker_text(value):
-    ticker = str(value).strip().upper()
-    if not TICKER_PATTERN.fullmatch(ticker):
-        raise LedgerError("股票代號須為台灣市場代號，並包含 .TW 或 .TWO。")
-    return ticker
+    ticker = value.strip().upper() if isinstance(value, str) else ""
+    if TICKER_PATTERN.fullmatch(ticker):
+        return ticker
+    if is_us_ticker(ticker):
+        return ticker.replace(".", "-")
+    raise LedgerError("請輸入台股代號（.TW／.TWO）或美股代號，例如 AAPL、BRK.B。")
+
+
+def share_count(value, ticker, label="股數"):
+    if not is_us_ticker(ticker):
+        return integer(value, label)
+    try:
+        n = Decimal(str(value))
+        if (isinstance(value, bool) or not n.is_finite() or not 0 < n <= 10**12
+                or n != n.quantize(US_SHARE_UNIT)):
+            raise ValueError()
+        return n.quantize(US_SHARE_UNIT)
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise LedgerError(f"美股{label}必須大於零，最多保留 {US_SHARE_SCALE} 位小數。") from exc
+
+
+def share_text(value):
+    n = Decimal(str(value))
+    if not n:
+        return "0"
+    text = format(n, "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def serializable_holdings(positions):
+    return {ticker: share_text(shares) if is_us_ticker(ticker) else shares
+            for ticker, shares in positions.items()}
+
+
+def _optional_usd_price(value):
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    try:
+        price = Decimal(str(value))
+        if (isinstance(value, bool) or not price.is_finite() or not 0 < price <= 10**15
+                or price != price.quantize(US_SHARE_UNIT)):
+            raise ValueError()
+        return price
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise LedgerError("美元成交單價可留空；若填寫，須為大於零的數字，最多 12 位小數。") from exc
+
+
+def _trade_values(event):
+    ticker = ticker_text(event["ticker"])
+    us = is_us_ticker(ticker)
+    shares = share_count(event["shares"], ticker)
+    fee = money(event.get("fee", 0) if us else event["fee"])
+    tax, other = money(event.get("tax", 0)), money(event.get("other_fee", 0))
+    if min(fee, tax, other) < 0:
+        raise LedgerError("成交價必須大於零，費用不能為負數。")
+    values = {"ticker": ticker, "shares": shares, "fee": fee, "tax": tax, "other_fee": other}
+    if us:
+        if event.get("settled_twd") in (None, ""):
+            raise LedgerError("美股交易必須填寫券商實際扣款／入帳的台幣金額。")
+        net = money(event["settled_twd"])
+        if net <= 0:
+            raise LedgerError("美股券商實際扣款／入帳的台幣金額必須大於零。")
+        # Net settlement already includes fees; the optional USD price is informational only.
+        values.update(price=net / shares, settled_twd=net,
+                      trade_price_usd=_optional_usd_price(event.get("trade_price_usd")))
+    else:
+        price = money(event["price"])
+        if price <= 0:
+            raise LedgerError("成交價必須大於零，費用不能為負數。")
+        values["price"] = price
+        costs = fee + tax + other
+        net = money(price * shares + (costs if event["action"] == "buy" else -costs))
+    return values, net
+
+
+def trade_cash_amount(event):
+    """Positive buy debit / sell credit in TWD, using the broker's net for US trades."""
+    return _trade_values(event)[1]
 
 
 def amount_text(value):
@@ -177,18 +261,17 @@ def make_state(baseline, overrides=None):
     for rid, original in baseline_records(baseline).items():
         entry = overrides.get(rid, original)
         if original["action"] == "buy":
+            # The legacy baseline balance was computed with the original single fee.
             old_cost = money(money(original["price"]) * integer(original["shares"]) + money(original["fee"]))
-            new_cost = (money(money(entry["price"]) * integer(entry["shares"]) + money(entry["fee"]) +
-                              money(entry.get("tax", 0)) + money(entry.get("other_fee", 0)))
-                        if entry else Decimal("0.00"))
+            values, new_cost = _trade_values(entry) if entry else ({}, Decimal("0.00"))
             state["balance"] += old_cost - new_cost
             if entry:
-                shares = integer(entry["shares"])
-                price, fee = money(entry["price"]), money(entry["fee"])
-                if price <= 0 or min(fee, money(entry.get("tax", 0)), money(entry.get("other_fee", 0))) < 0:
-                    raise LedgerError("舊買入的單價或費用無效。")
-                state["buys"].append({**entry, "ticker": ticker_text(entry["ticker"]), "shares": shares,
-                                      "remaining": shares, "price": price, "fee": fee,
+                shares = values["shares"]
+                if not is_us_ticker(values["ticker"]):
+                    # Preserve the old baseline's fee-field shape and original metadata.
+                    values.pop("tax")
+                    values.pop("other_fee")
+                state["buys"].append({**entry, **values, "remaining": shares,
                                       "remaining_cost": new_cost, "original_shares": shares})
         else:
             old_amount = money(original["amount"])
@@ -212,6 +295,19 @@ def holdings(state):
     return result
 
 
+def _fifo_lot_cost(lot, taken):
+    if taken == lot["remaining"]:
+        return lot["remaining_cost"]
+    if not is_us_ticker(lot["ticker"]):
+        return money(lot["remaining_cost"] * taken / lot["remaining"])
+    # Round only the exact rational allocation to cents, even at a half-cent boundary.
+    cost_cents = int(lot["remaining_cost"].scaleb(2))
+    remaining_units = int(lot["remaining"].scaleb(US_SHARE_SCALE))
+    taken_units = int(taken.scaleb(US_SHARE_SCALE))
+    cents, remainder = divmod(cost_cents * taken_units, remaining_units)
+    return Decimal(cents + (2 * remainder >= remaining_units)).scaleb(-2)
+
+
 def apply_record(state, event, *, chronological_fifo=False):
     action, rid = event["action"], event["id"]
     day = event.get("date", "")
@@ -221,7 +317,7 @@ def apply_record(state, event, *, chronological_fifo=False):
     if action in POSITION_ACTIONS:
         ticker = ticker_text(event["ticker"])
         if action == "set_existing_holding":
-            shares = integer(event["shares"], "既有庫存股數")
+            shares = share_count(event["shares"], ticker, "既有庫存股數")
             state["existing_holdings"][ticker] = shares
         else:
             state["existing_holdings"].pop(ticker, None)
@@ -245,23 +341,18 @@ def apply_record(state, event, *, chronological_fifo=False):
             category = {"deposit": "deposits", "withdrawal": "withdrawals", "dividend": "dividends"}[action]
             state[category].append(entry)
     elif action in {"buy", "sell"}:
-        shares, price, fee = integer(event["shares"]), money(event["price"]), money(event["fee"])
-        tax, other = money(event.get("tax", 0)), money(event.get("other_fee", 0))
-        ticker = ticker_text(event["ticker"])
-        if price <= 0 or min(fee, tax, other) < 0:
-            raise LedgerError("成交價必須大於零，費用不能為負數。")
-        costs = fee + tax + other
-        entry = {"id": rid, "action": action, "date": day, "ticker": ticker, "shares": shares,
-                 "price": price, "fee": fee, "tax": tax, "other_fee": other, "note": note}
+        values, net = _trade_values(event)
+        ticker, shares = values["ticker"], values["shares"]
+        entry = {"id": rid, "action": action, "date": day, "note": note, **values}
         if action == "buy":
-            cost = money(price * shares + costs)
+            cost = net
             if cost > state["balance"]:
                 raise LedgerError("買入超過該交易日期的現金餘額。")
             state["balance"] -= cost
             state["buys"].append({**entry, "remaining": shares, "remaining_cost": cost,
                                   "original_shares": shares})
         else:
-            proceeds = money(price * shares - costs)
+            proceeds = net
             if proceeds < 0 or holdings(state).get(ticker, 0) < shares:
                 raise LedgerError("賣出股數超過該日期庫存，或實收金額為負數。")
             money(state["balance"] + proceeds)
@@ -273,8 +364,7 @@ def apply_record(state, event, *, chronological_fifo=False):
                 if lot["ticker"] != ticker or not lot["remaining"]:
                     continue
                 taken = min(remaining, lot["remaining"])
-                cost = (lot["remaining_cost"] if taken == lot["remaining"] else
-                        money(lot["remaining_cost"] * taken / lot["remaining"]))
+                cost = _fifo_lot_cost(lot, taken)
                 lot["remaining"] -= taken
                 lot["remaining_cost"] -= cost
                 basis += cost
@@ -294,10 +384,17 @@ def apply_record(state, event, *, chronological_fifo=False):
         for lot in state["buys"]:
             if lot["ticker"] != ticker or not lot["remaining"]:
                 continue
-            new_shares, remainder = divmod(lot["remaining"] * numerator, denominator)
-            if remainder or new_shares <= 0:
-                raise LedgerError("本次調整會產生不足一股；請依券商明細另行處理，不能自動捨去。")
-            integer(new_shares)
+            if is_us_ticker(ticker):
+                units = int(lot["remaining"].scaleb(US_SHARE_SCALE))
+                new_units, remainder = divmod(units * numerator, denominator)
+                if remainder or not 0 < new_units <= 10 ** (12 + US_SHARE_SCALE):
+                    raise LedgerError(f"股數調整後無法精確表示為最多 {US_SHARE_SCALE} 位小數；請核對券商明細。")
+                new_shares = Decimal(new_units).scaleb(-US_SHARE_SCALE)
+            else:
+                new_shares, remainder = divmod(lot["remaining"] * numerator, denominator)
+                if remainder or new_shares <= 0:
+                    raise LedgerError("本次調整會產生不足一股；請依券商明細另行處理，不能自動捨去。")
+                integer(new_shares)
             changes.append((lot, new_shares))
         for lot, new_shares in changes:
             lot["remaining"] = new_shares  # Cost is conserved; original trade shares stay unchanged.
@@ -345,6 +442,10 @@ def replay_effective(baseline, accepted):
             if target not in originals:
                 raise LedgerError("更正目標不存在或尚未入帳。")
             replacement = event.get("replacement")
+            affected = (originals[target], overrides.get(target), replacement)
+            if (event.get("schema_version") != 3 and
+                    any(isinstance(record, dict) and is_us_ticker(record.get("ticker")) for record in affected)):
+                raise LedgerError("美股更正需要支援美股的帳本版本。")
             if replacement is not None:
                 replacement = {**replacement, "id": target}
                 if replacement["action"] != originals[target]["action"]:
@@ -357,14 +458,14 @@ def replay_effective(baseline, accepted):
         elif event["action"] != "baseline":
             if event["action"] in BUSINESS_ACTIONS:
                 originals[event["id"]] = event
-            (modern if event.get("schema_version") == 2 else legacy).append(event)
+            (modern if event.get("schema_version") in MODERN_SCHEMAS else legacy).append(event)
     cutoff_days = [trade_day(e["date"]) for e in baseline_records(baseline).values() if e.get("date")]
     cutoff_days.extend(trade_day(e["date"]) for e in legacy
                        if e.get("date") and e["action"] not in POSITION_ACTIONS | {"snapshot"})
     cutoff = max(cutoff_days, default=date.min)
     for rid, replacement in overrides.items():
         if (replacement and originals[rid]["action"] not in POSITION_ACTIONS
-                and originals[rid].get("schema_version") != 2 and trade_day(replacement["date"]) > cutoff):
+                and originals[rid].get("schema_version") not in MODERN_SCHEMAS and trade_day(replacement["date"]) > cutoff):
             raise LedgerError("舊帳更正日期不得跨入新版期間；此情境需要專門的帳本遷移。")
     state = make_state(baseline, overrides)
     for original in legacy:
@@ -394,7 +495,7 @@ def replay_effective(baseline, accepted):
         if original["action"] in POSITION_ACTIONS:
             effective = overrides.get(original["id"], original)
             if effective:
-                if original.get("schema_version") == 2:
+                if original.get("schema_version") in MODERN_SCHEMAS:
                     validate_new_record(effective)
                 apply_record(state, effective)
     # Old delete events remain authoritative and cannot be casually undone by restoring an absent record.
@@ -452,9 +553,9 @@ def load_bundle(raw_baseline, events):
         if rid.startswith("legacy-"):
             raise LedgerError("事件 ID 不得使用舊 A1 紀錄的保留前綴 legacy-。")
         version = event.get("schema_version")
-        if version not in (None, 1, 2):
+        if version not in (None, 1, *MODERN_SCHEMAS):
             raise LedgerError(f"Events 第 {row_number} 筆格式版本不受支援。")
-        if version == 2:
+        if version in MODERN_SCHEMAS:
             modern_seen = True
             check = {k: v for k, v in event.items() if k != "event_hash"}
             if event.get("event_hash") != digest(check):
@@ -468,33 +569,35 @@ def load_bundle(raw_baseline, events):
             # Normal chronological appends can be applied in one pass. Only
             # amendments and backdated records need a complete historical replay.
             # apply_record validates before mutating each operation.
-            fast = action != "amend" and (version != 2 or action in BUSINESS_ACTIONS)
+            if version != 3 and is_us_ticker(event.get("ticker")):
+                raise LedgerError("美股交易需要支援美股的帳本版本。")
+            fast = action != "amend" and (version not in MODERN_SCHEMAS or action in BUSINESS_ACTIONS)
             event_day = trade_day(event["date"]) if event.get("date") else None
-            if version == 2 and action in BUSINESS_ACTIONS:
+            if version in MODERN_SCHEMAS and action in BUSINESS_ACTIONS:
                 validate_new_record(event)
                 if action not in POSITION_ACTIONS and event_day < cutoff:
                     raise LedgerError(f"新交易日期早於舊帳截止日 {cutoff}；請更正原紀錄。")
                 fast = action in POSITION_ACTIONS or event_day >= last_modern_day
             if fast:
-                apply_record(state, event, chronological_fifo=version == 2)
+                apply_record(state, event, chronological_fifo=version in MODERN_SCHEMAS)
                 if action in BUSINESS_ACTIONS:
                     item = {"id": rid, "original": event, "effective": event, "status": "有效"}
                     records.append(item)
                     record_index[rid] = item
                 elif action == "delete" and event["target_id"] in record_index:
                     record_index[event["target_id"]]["status"] = "舊版已刪除"
-                if version != 2 and event_day and action not in POSITION_ACTIONS | {"snapshot"}:
+                if version not in MODERN_SCHEMAS and event_day and action not in POSITION_ACTIONS | {"snapshot"}:
                     cutoff = max(cutoff, event_day)
-                if version == 2 and event_day and action not in POSITION_ACTIONS:
+                if version in MODERN_SCHEMAS and event_day and action not in POSITION_ACTIONS:
                     last_modern_day = max(last_modern_day, event_day)
             else:
                 state, records, cutoff = replay_effective(baseline, accepted + [event])
                 record_index = {r["id"]: r for r in records}
                 last_modern_day = max((trade_day(r["effective"]["date"]) for r in records
-                    if r["effective"] and r["original"].get("schema_version") == 2
+                    if r["effective"] and r["original"].get("schema_version") in MODERN_SCHEMAS
                     and r["original"]["action"] not in POSITION_ACTIONS), default=date.min)
         except (LedgerError, KeyError, TypeError) as exc:
-            if version != 2:
+            if version not in MODERN_SCHEMAS:
                 raise LedgerError(f"Events 第 {row_number} 筆舊資料無法回放：{exc}") from exc
             statuses[rid] = {"status": "驗證失敗未入帳", "reason": str(exc)}
             continue
@@ -508,10 +611,41 @@ def load_bundle(raw_baseline, events):
     return Ledger(raw_baseline, baseline, events, accepted, state, records, statuses, revision, cutoff, warnings)
 
 
+def _normalize_event_fields(action, fields):
+    fields = dict(fields)
+    if action == "amend" and isinstance(fields.get("replacement"), dict):
+        replacement = fields["replacement"]
+        fields["replacement"] = _normalize_event_fields(replacement.get("action"), replacement)
+    ticker = fields.get("ticker")
+    if is_us_ticker(ticker):
+        fields["ticker"] = ticker_text(ticker)
+        if "shares" in fields:
+            fields["shares"] = share_text(share_count(fields["shares"], ticker))
+        if action in {"buy", "sell"}:
+            usd = _optional_usd_price(fields.get("trade_price_usd"))
+            if usd is not None:
+                fields["trade_price_usd"] = share_text(usd)
+            else:
+                fields.pop("trade_price_usd", None)
+    elif isinstance(fields.get("shares"), Decimal):
+        fields["shares"] = integer(fields["shares"])
+    for key in ("settled_twd", "price", "fee", "tax", "other_fee", "amount"):
+        if isinstance(fields.get(key), Decimal):
+            fields[key] = str(fields[key])
+    return fields
+
+
 def create_event(ledger, action, *, operation_id=None, **fields):
+    fields = _normalize_event_fields(action, fields)
+    us = is_us_ticker(fields.get("ticker"))
+    if action == "amend":
+        target = next((r for r in ledger.records if r["id"] == fields.get("target_id")), {})
+        affected = (target.get("original"), target.get("effective"), fields.get("replacement"))
+        us = any(isinstance(r, dict) and is_us_ticker(r.get("ticker")) for r in affected)
     event = {**fields, "id": operation_id or str(uuid.uuid4()), "action": action,
              "date": fields.get("date", datetime.now(TZ).date().isoformat()),
-             "recorded_at": now_text(), "schema_version": 2, "expected_revision": ledger.revision}
+             "recorded_at": now_text(), "schema_version": 3 if us else 2,
+             "expected_revision": ledger.revision}
     if ledger.source_spreadsheet_id:
         event["source_spreadsheet_id"] = ledger.source_spreadsheet_id
     event["event_hash"] = digest(event)
@@ -577,7 +711,8 @@ def validate_backup(content):
 
 def records_csv(ledger):
     buffer = io.StringIO()
-    fields = ["id", "狀態", "日期", "類型", "代號", "股數", "單價", "金額", "手續費", "交易稅", "其他費用", "備註"]
+    fields = ["id", "狀態", "日期", "類型", "代號", "股數", "單價", "金額", "手續費", "交易稅", "其他費用", "備註",
+              "美元成交單價", "券商實際台幣扣款／入帳"]
     writer = csv.DictWriter(buffer, fieldnames=fields)
     writer.writeheader()
     for item in ledger.records:
@@ -586,7 +721,8 @@ def records_csv(ledger):
                "類型": LABELS.get(e["action"], e["action"]), "代號": e.get("ticker", ""),
                "股數": e.get("shares", ""), "單價": e.get("price", ""), "金額": e.get("amount", ""),
                "手續費": e.get("fee", ""), "交易稅": e.get("tax", ""),
-               "其他費用": e.get("other_fee", ""), "備註": e.get("note", "")}
+               "其他費用": e.get("other_fee", ""), "備註": e.get("note", ""),
+               "美元成交單價": e.get("trade_price_usd", ""), "券商實際台幣扣款／入帳": e.get("settled_twd", "")}
         # Spreadsheet formula injection protection for CSV users.
         for key, value in row.items():
             if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@", "\t", "\r")):
@@ -815,6 +951,9 @@ def twse_quote(ticker):
 
 
 def quote_uncached(ticker):
+    if is_us_ticker(ticker):
+        from us_market import latest_quote
+        return latest_quote(ticker)
     try:
         import yfinance as yf
         history = yf.Ticker(ticker).history(period="5d", auto_adjust=False, timeout=10)
@@ -838,7 +977,8 @@ MOBILE_KEYBOARD_HTML = """
   const rules = [
     ['[class*="st-key-pc_numeric_ticker_"] input[type="text"]', 'numeric'],
     ['[class*="st-key-pc_integer_"] input[type="number"]', 'numeric'],
-    ['[class*="st-key-pc_decimal_"] input[type="number"]', 'decimal']
+    ['[class*="st-key-pc_decimal_"] input[type="number"]', 'decimal'],
+    ['[class*="st-key-pc_decimal_text_"] input[type="text"]', 'decimal']
   ];
   const apply = (root) => {
     for (const [selector, mode] of rules) {
@@ -883,8 +1023,16 @@ def numeric_input(st, label, **kwargs):
         return st.number_input(label, **kwargs)
 
 
+def decimal_text_input(st, label, *, key, value="", placeholder=None):
+    with st.container(key="pc_decimal_text_" + key):
+        return st.text_input(label, key=key, value=value, placeholder=placeholder,
+                             max_chars=32, autocomplete="off").strip()
+
+
 def ticker_input_parts(value):
     text = value.strip().upper()
+    if is_us_ticker(text):
+        return text, "US", ""
     symbol, separator, market = text.rpartition(".")
     if not separator:
         symbol, market = text, "TW"
@@ -896,6 +1044,8 @@ def assemble_ticker(code, market, suffix=""):
     code, suffix = code.strip().upper(), suffix.strip().upper()
     if not code:
         return ""
+    if market == "US":
+        return code
     # A complete pasted symbol wins over stale market/suffix form values.
     if "." in code:
         return code
@@ -904,8 +1054,14 @@ def assemble_ticker(code, market, suffix=""):
     return code + suffix + "." + market
 
 
-def ticker_input(st, label, *, value, key):
+def ticker_input(st, label, *, value, key, market_group=None):
     code, market, suffix = ticker_input_parts(value)
+    if (market_group or market) == "US":
+        return assemble_ticker(st.text_input(label, value=code if market == "US" else "",
+                                             placeholder="例如 AAPL、VOO、BRK.B", max_chars=16,
+                                             autocomplete="off", key=key + "_us"), "US")
+    if market == "US":
+        code, market, suffix = "", "TW", ""
     code_column, market_column = st.columns([2, 1], gap="medium")
     with code_column:
         with st.container(key="pc_numeric_ticker_" + key):
@@ -919,6 +1075,24 @@ def ticker_input(st, label, *, value, key):
         suffix = st.text_input("英文字尾（選填，例如 B）", value=suffix, max_chars=8,
                                autocomplete="off", key=key + "_suffix")
     return assemble_ticker(code, market, suffix)
+
+
+def stock_market_selector(st, *, key, initial="", disabled=False):
+    return st.radio("股票市場", ("TW", "US"), index=int(is_us_ticker(initial)), horizontal=True,
+                    format_func=lambda market: "美股" if market == "US" else "台股",
+                    key=key, disabled=disabled)
+
+
+def market_matches(st, ticker, market_group):
+    try:
+        ticker = ticker_text(ticker)
+    except LedgerError as exc:
+        st.error(str(exc))
+        return False
+    if is_us_ticker(ticker) != (market_group == "US"):
+        st.error("股票代號與所選市場不符，請先選擇正確的市場。")
+        return False
+    return True
 
 
 def style_forms(st):
@@ -1073,7 +1247,8 @@ def render_pending(st, store, ledger):
             c1.metric("確認後現金", amount_text(trial.state["balance"]),
                       amount_text(trial.state["balance"] - ledger.state["balance"]))
             c2.write("確認後庫存")
-            c2.json({"原本帳務庫存": holdings(trial.state), "既有庫存": trial.state["existing_holdings"]})
+            c2.json({"原本帳務庫存": serializable_holdings(holdings(trial.state)),
+                     "既有庫存": serializable_holdings(trial.state["existing_holdings"])})
         elif event["id"] in ledger.statuses:
             st.write("目前狀態：" + ledger.statuses[event["id"]]["status"])
         else:
@@ -1119,14 +1294,27 @@ def render_pending(st, store, ledger):
     return True
 
 
-def dataframe(st, rows, *, money_columns=()):
+def dataframe(st, rows, *, money_columns=(), usd_columns=(), rate_columns=()):
     import pandas as pd
     if not rows:
         st.caption("目前沒有紀錄。")
         return
     configs = {c: st.column_config.NumberColumn(c, format="NT$ %.2f", width="medium") for c in money_columns}
+    configs.update({c: st.column_config.NumberColumn(c, format="US$ %.4f", width="medium") for c in usd_columns})
+    configs.update({c: st.column_config.NumberColumn(c, format="%.6f", width="medium") for c in rate_columns})
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", column_config=configs,
                  row_height=48, height=min(520, (len(rows) + 1) * 48 + 3))
+
+
+def quote_display(quote, *, include_fx=False):
+    result = {"參考收盤價": float(quote["price"]) if quote else None,
+              "報價日期": (quote.get("market_date") or trade_day(quote["at"]).isoformat()) if quote else "無法取得",
+              "行情來源": quote.get("source", "未標示") if quote else "無法取得"}
+    if include_fx:
+        result.update({"美元收盤價": float(quote["usd_price"]) if quote and quote.get("usd_price") is not None else None,
+                       "美元兌台幣匯率": float(quote["fx_rate"]) if quote and quote.get("fx_rate") is not None else None,
+                       "匯率日期": trade_day(quote["fx_at"]).isoformat() if quote and quote.get("fx_at") else ""})
+    return result
 
 
 def render_overview(st, ledger, prices, parts, market, assets):
@@ -1150,30 +1338,38 @@ def render_overview(st, ledger, prices, parts, market, assets):
         st.progress(max(0.0, min(float(assets / state["target"]), 1.0)),
                     text=f"資產達成率 {assets / state['target']:.2%} · 目標 {amount_text(state['target'])}")
     rows = []
-    for ticker, shares in holdings(state).items():
+    positions = holdings(state)
+    show_us = any(is_us_ticker(ticker) for ticker in positions)
+    for ticker, shares in positions.items():
         basis = sum((lot["remaining_cost"] for lot in state["buys"] if lot["ticker"] == ticker), Decimal("0.00"))
         q = prices.get(ticker)
         value = money(q["price"] * shares) if q else None
-        rows.append({"代號": ticker, "股數": shares, "剩餘成本": float(basis), "平均成本": float(basis / shares),
-                     "參考收盤價": float(q["price"]) if q else None, "市值": float(value) if value is not None else None,
+        rows.append({"代號": ticker, "股數": share_text(shares), "剩餘成本": float(basis), "平均成本": float(basis / shares),
+                     "市值": float(value) if value is not None else None,
                      "未實現損益": float(value - basis) if value is not None else None,
-                     "報價日期": trade_day(q["at"]).isoformat() if q else "無法取得",
-                     "行情來源": q.get("source", "未標示") if q else "無法取得"})
+                     **quote_display(q, include_fx=show_us)})
     st.subheader("庫存彙總")
-    dataframe(st, rows, money_columns=("剩餘成本", "平均成本", "參考收盤價", "市值", "未實現損益"))
+    if show_us:
+        st.caption("美股以美元收盤價乘匯率換算；報價日期是美股交易日，匯率日期另列。")
+    dataframe(st, rows, money_columns=("剩餘成本", "平均成本", "參考收盤價", "市值", "未實現損益"),
+              usd_columns=("美元收盤價",) if show_us else (), rate_columns=("美元兌台幣匯率",) if show_us else ())
     with st.expander("買入批次與 FIFO 成本"):
         dataframe(st, [{"ID": b["id"], "日期": b["date"], "代號": b["ticker"],
-                        "原始成交股數": b["original_shares"], "目前剩餘股數": b["remaining"],
-                        "成交價": float(b["price"]), "剩餘成本": float(b["remaining_cost"])} for b in state["buys"]],
-                  money_columns=("成交價", "剩餘成本"))
+                        "原始成交股數": share_text(b["original_shares"]), "目前剩餘股數": share_text(b["remaining"]),
+                        "成交價": float(b["price"]) if not is_us_ticker(b["ticker"]) else None,
+                        "剩餘成本": float(b["remaining_cost"]),
+                        **({"台幣實扣": float(b["settled_twd"]),
+                            "美元成交單價": float(b["trade_price_usd"]) if b.get("trade_price_usd") is not None else None}
+                           if is_us_ticker(b["ticker"]) else {})} for b in state["buys"]],
+                  money_columns=("成交價", "台幣實扣", "剩餘成本"), usd_columns=("美元成交單價",))
     with st.expander("已實現損益與賣出成本分攤"):
-        dataframe(st, [{"ID": s["id"], "日期": s["date"], "代號": s["ticker"], "股數": s["shares"],
+        dataframe(st, [{"ID": s["id"], "日期": s["date"], "代號": s["ticker"], "股數": share_text(s["shares"]),
                         "實收": float(s["proceeds"]), "分攤成本": float(s["basis"]),
                         "已實現損益": float(s["realized"])} for s in state["sells"]],
                   money_columns=("實收", "分攤成本", "已實現損益"))
         if state["sells"]:
             sale = st.selectbox("查看賣出成本分攤 ID", state["sells"], format_func=lambda s: s["id"])
-            dataframe(st, [{"買入 ID": a["buy_id"], "股數": a["shares"], "成本": float(money(a["cost"]))}
+            dataframe(st, [{"買入 ID": a["buy_id"], "股數": share_text(a["shares"]), "成本": float(money(a["cost"]))}
                            for a in sale["allocations"]], money_columns=("成本",))
 
 
@@ -1189,38 +1385,47 @@ def render_existing_holdings(st, ledger, quote, *, disabled=False):
         if missing:
             st.warning("既有庫存報價不完整：" + "、".join(missing) + "。此區總市值暫不顯示。")
         rows = []
+        show_us = any(is_us_ticker(ticker) for ticker in positions)
         for ticker, shares in sorted(positions.items()):
             q = prices[ticker]
-            rows.append({"代號": ticker, "股數": shares,
-                         "參考收盤價": float(q["price"]) if q else None,
+            rows.append({"代號": ticker, "股數": share_text(shares),
                          "市值": float(money(q["price"] * shares)) if q else None,
-                         "報價日期": trade_day(q["at"]).isoformat() if q else "無法取得",
-                         "行情來源": q.get("source", "未標示") if q else "無法取得"})
+                         **quote_display(q, include_fx=show_us)})
         if rows:
-            dataframe(st, rows, money_columns=("參考收盤價", "市值"))
+            dataframe(st, rows, money_columns=("參考收盤價", "市值"),
+                      usd_columns=("美元收盤價",) if show_us else (), rate_columns=("美元兌台幣匯率",) if show_us else ())
         else:
             st.info("尚未加入既有庫存，可在下方輸入股票代號與目前持有股數。")
         st.caption("未登記買入成本，因此不計算既有庫存損益。日後股數改變時，直接更新目前總股數。")
         with st.expander("新增、更新或移除既有庫存", expanded=not positions):
+            market_group = stock_market_selector(st, key="existing_market_group", disabled=disabled)
             with st.form("existing_holding", width=760):
-                ticker = ticker_input(st, "既有股票代碼", value="", key="existing_ticker")
-                shares = numeric_input(st, "目前持有股數", min_value=1, max_value=10**12,
-                                         value=1000, step=1, key="existing_shares")
-                st.caption("1 張 = 1,000 股。同一代號再次儲存會更新為指定的總股數，不會累加。")
-                if st.form_submit_button("預覽既有庫存", disabled=disabled):
+                ticker = ticker_input(st, "既有股票代碼", value="", key="existing_ticker", market_group=market_group)
+                if market_group == "US":
+                    shares = decimal_text_input(st, "目前持有股數", placeholder="例如 0.25", key="existing_shares_us")
+                else:
+                    shares = numeric_input(st, "目前持有股數", min_value=1, max_value=10**12,
+                                           value=1000, step=1, key="existing_shares")
+                st.caption(("美股可填小數股。" if market_group == "US" else "1 張 = 1,000 股。") +
+                           "同一代號再次儲存會更新為指定的總股數，不會累加。")
+                if st.form_submit_button("預覽既有庫存", disabled=disabled) and market_matches(st, ticker, market_group):
                     stage(st, ledger, "set_existing_holding", ticker=ticker, shares=shares)
             if positions:
                 with st.form("remove_existing_holding", enter_to_submit=False, width=760):
                     ticker = st.selectbox("選擇要移除的既有庫存", sorted(positions),
                                           key="remove_existing_ticker",
-                                          format_func=lambda symbol: f"{symbol}（{positions[symbol]:,} 股）")
+                                          format_func=lambda symbol: f"{symbol}（{share_text(positions[symbol])} 股）")
                     st.caption("移除只會取消追蹤，不登記賣出，也不增加現金。")
                     if st.form_submit_button("預覽移除既有庫存", disabled=disabled):
                         stage(st, ledger, "remove_existing_holding", ticker=ticker)
 
 
-def record_fields(st, action, state, *, prefix, initial=None):
+def record_fields(st, action, state, *, prefix, initial=None, market_group=None):
     initial = initial or {}
+    initial_is_us = is_us_ticker(initial.get("ticker", ""))
+    market_group = market_group or ("US" if initial_is_us else "TW")
+    is_us = market_group == "US"
+    trade_defaults = initial if is_us == initial_is_us else {}
     today = datetime.now(TZ).date()
     default_day = trade_day(initial["date"]) if initial.get("date") else today
     fields = {}
@@ -1231,40 +1436,60 @@ def record_fields(st, action, state, *, prefix, initial=None):
     if action in POSITION_ACTIONS:
         with ticker_column:
             fields["ticker"] = ticker_input(st, "既有股票代碼", value=initial.get("ticker", "006208.TW"),
-                                            key=prefix + "_ticker")
+                                            key=prefix + "_ticker", market_group=market_group)
         if action == "set_existing_holding":
-            fields["shares"] = numeric_input(st, "目前持有股數", min_value=1, max_value=10**12,
-                                              value=integer(initial.get("shares", 1000)),
-                                              step=1, key=prefix + "_shares")
+            if is_us:
+                fields["shares"] = decimal_text_input(st, "目前持有股數", placeholder="例如 0.25",
+                    value=share_text(trade_defaults["shares"]) if "shares" in trade_defaults else "",
+                    key=prefix + "_shares_us")
+            else:
+                fields["shares"] = numeric_input(st, "目前持有股數", min_value=1, max_value=10**12,
+                                                  value=integer(trade_defaults.get("shares", 1000)),
+                                                  step=1, key=prefix + "_shares")
         fields["note"] = st.text_area("備註", value=initial.get("note", ""), max_chars=500,
                                       height=96, key=prefix + "_note")
         return fields
     if action in {"buy", "sell", "dividend", "split"}:
         historical = sorted({b["ticker"] for b in state["buys"]} | {d.get("ticker", "") for d in state["dividends"]} - {""})
-        st.caption("股票代碼可只填數字，市場由選單選擇；也可貼上完整代號。可補登已清倉股票的股息。")
+        st.caption(("美股輸入英文代號，例如 AAPL、VOO 或 BRK.B。" if is_us else
+                    "台股可只填數字並選擇上市或上櫃，也可貼上完整代號。") + "可補登已清倉股票的股息。")
         if historical:
             st.caption("曾持有：" + "、".join(historical))
         with ticker_column:
             fields["ticker"] = ticker_input(st, "股票代碼", value=initial.get("ticker", "006208.TW"),
-                                            key=prefix + "_ticker")
-    if action in {"buy", "sell"}:
+                                            key=prefix + "_ticker", market_group=market_group)
+    if action in {"buy", "sell"} and is_us:
+        shares_column, net_column = st.columns(2, gap="medium")
+        with shares_column:
+            fields["shares"] = decimal_text_input(st, "成交股數（可填小數）", placeholder="例如 0.25",
+                value=share_text(trade_defaults["shares"]) if "shares" in trade_defaults else "",
+                key=prefix + "_shares_us")
+        with net_column:
+            fields["settled_twd"] = decimal_text_input(st, "台幣實際扣款 NT$" if action == "buy" else "台幣實際入帳 NT$",
+                value=str(trade_defaults.get("settled_twd", "")), key=prefix + "_settled_twd")
+        usd = decimal_text_input(st, "美元成交單價 US$（選填）", key=prefix + "_trade_price_usd",
+            value=str(trade_defaults.get("trade_price_usd") or ""))
+        if usd:
+            fields["trade_price_usd"] = usd
+        st.caption("請填券商明細上的最終台幣金額，已反映手續費等費用。美元單價僅供核對。")
+    elif action in {"buy", "sell"}:
         shares_column, price_column = st.columns(2, gap="medium")
         with shares_column:
-            fields["shares"] = numeric_input(st, "成交股數", min_value=1, value=integer(initial.get("shares", 1)),
+            fields["shares"] = numeric_input(st, "成交股數", min_value=1, value=integer(trade_defaults.get("shares", 1)),
                                               step=1, key=prefix + "_shares")
         with price_column:
             fields["price"] = str(money(numeric_input(st, "成交單價 NT$", min_value=0.01,
-                                  value=float(initial.get("price", 1)), step=0.01, format="%.2f", key=prefix + "_price")))
+                                  value=float(trade_defaults.get("price", 1)), step=0.01, format="%.2f", key=prefix + "_price")))
         fee_column, tax_column, other_column = st.columns(3, gap="medium")
         with fee_column:
             fields["fee"] = str(money(numeric_input(st, "手續費 NT$", min_value=0.0,
-                                value=float(initial.get("fee", 0)), step=1.0, format="%.2f", key=prefix + "_fee")))
+                                value=float(trade_defaults.get("fee", 0)), step=1.0, format="%.2f", key=prefix + "_fee")))
         with tax_column:
             fields["tax"] = str(money(numeric_input(st, "交易稅 NT$", help="依券商明細填入。", min_value=0.0,
-                                value=float(initial.get("tax", 0)), step=1.0, format="%.2f", key=prefix + "_tax")))
+                                value=float(trade_defaults.get("tax", 0)), step=1.0, format="%.2f", key=prefix + "_tax")))
         with other_column:
             fields["other_fee"] = str(money(numeric_input(st, "其他費用 NT$", min_value=0.0,
-                                      value=float(initial.get("other_fee", 0)), step=1.0, format="%.2f", key=prefix + "_other")))
+                                      value=float(trade_defaults.get("other_fee", 0)), step=1.0, format="%.2f", key=prefix + "_other")))
         net = money(money(fields["price"]) * fields["shares"] +
                     (1 if action == "buy" else -1) * (money(fields["fee"]) + money(fields["tax"]) + money(fields["other_fee"])))
         st.caption(("應付" if action == "buy" else "實收") + "：" + amount_text(net) + "（提交預覽後再確認）")
@@ -1280,7 +1505,8 @@ def record_fields(st, action, state, *, prefix, initial=None):
     else:
         default = initial.get("amount", state["target"] if action == "target" and state["target"] else 1000)
         with ticker_column:
-            fields["amount"] = str(money(numeric_input(st, "實收／支出／目標金額 NT$", min_value=0.01,
+            label = "股息台幣實際入帳 NT$" if action == "dividend" and is_us else "實收／支出／目標金額 NT$"
+            fields["amount"] = str(money(numeric_input(st, label, min_value=0.01,
                                     value=float(default), step=100.0, format="%.2f", key=prefix + "_amount")))
     fields["note"] = st.text_area("備註", value=initial.get("note", ""), max_chars=500,
                                   height=96, placeholder="選填，例如交易用途或補充說明", key=prefix + "_note")
@@ -1292,10 +1518,14 @@ def render_entry(st, ledger, *, disabled=False):
     action = st.selectbox("操作類型", ["buy", "sell", "deposit", "withdrawal", "dividend", "target", "split"],
                            format_func=lambda a: LABELS[a], key="entry_action", width=320)
     st.caption(f"舊帳截止日：{ledger.cutoff if ledger.cutoff != date.min else '尚無舊帳'}。新帳可按交易日期補登；同日依登記順序。")
+    prefix = "entry_" + action
+    market_group = (stock_market_selector(st, key=prefix + "_market_group", disabled=disabled)
+                    if action in {"buy", "sell", "dividend", "split"} else None)
     with st.form("entry_" + action, width=760):
-        fields = record_fields(st, action, ledger.state, prefix="entry_" + action)
+        fields = record_fields(st, action, ledger.state, prefix=prefix, market_group=market_group)
         if st.form_submit_button("預覽此筆操作", type="primary", disabled=disabled):
-            stage(st, ledger, action, **fields)
+            if market_group is None or market_matches(st, fields["ticker"], market_group):
+                stage(st, ledger, action, **fields)
 
 
 def render_records(st, ledger):
@@ -1311,16 +1541,19 @@ def render_records(st, ledger):
             continue
         net = None
         if e["action"] in {"buy", "sell"}:
-            costs = money(e["fee"]) + money(e.get("tax", 0)) + money(e.get("other_fee", 0))
-            net = money(money(e["price"]) * integer(e["shares"]) + (costs if e["action"] == "buy" else -costs))
+            net = trade_cash_amount(e)
         elif "amount" in e:
             net = money(e["amount"])
+        usd = e.get("trade_price_usd")
         rows.append({"ID": item["id"], "狀態": item["status"], "交易日期": trade_day(e["date"]).isoformat(),
                      "登記時間": e.get("recorded_at", "舊版未保存"), "類型": LABELS[e["action"]],
-                     "代號": e.get("ticker", ""), "股數": e.get("shares"),
-                     "應付／實收／金額": float(net) if net is not None else None, "備註": e.get("note", "")})
+                     "代號": e.get("ticker", ""), "股數": share_text(e["shares"]) if "shares" in e else None,
+                     "應付／實收／金額": float(net) if net is not None else None,
+                     **({"美元成交單價": float(usd) if usd not in (None, "") else None}
+                        if e["action"] in {"buy", "sell"} and is_us_ticker(e.get("ticker", "")) else {}),
+                     "備註": e.get("note", "")})
     rows.sort(key=lambda row: row["交易日期"], reverse=True)
-    dataframe(st, rows, money_columns=("應付／實收／金額",))
+    dataframe(st, rows, money_columns=("應付／實收／金額",), usd_columns=("美元成交單價",))
     st.download_button("匯出全部紀錄 CSV", records_csv(ledger), file_name="tracker_records.csv", mime="text/csv")
     st.caption("CSV 供對帳；完整還原請使用資料管理頁的 JSON 備份。舊版賣出費用欄已包含當時合併輸入的交易費用。")
 
@@ -1337,12 +1570,18 @@ def render_amend(st, ledger, *, disabled=False):
                             f"{r['status']} · {r['id'][-8:]}")
     mode = st.radio("處理方式", ["更正內容", "撤銷紀錄", "復原原始內容"], horizontal=True, key="amend_mode")
     st.caption("更正會重算後續現金、庫存與賣出成本；若出現不足，會拒絕執行。歷史行情快照不會自動改寫。")
+    initial = selected["effective"] or selected["original"]
+    prefix = "amend_" + selected["id"]
+    market_group = (stock_market_selector(st, key=prefix + "_market_group", initial=initial.get("ticker", ""), disabled=disabled)
+                    if mode == "更正內容" and initial["action"] in POSITION_ACTIONS | {"buy", "sell", "dividend", "split"} else None)
     with st.form("amend_" + selected["id"] + mode, width=760):
-        initial = selected["effective"] or selected["original"]
-        fields = record_fields(st, initial["action"], ledger.state, prefix="amend_" + selected["id"], initial=initial) if mode == "更正內容" else None
+        fields = (record_fields(st, initial["action"], ledger.state, prefix=prefix, initial=initial, market_group=market_group)
+                  if mode == "更正內容" else None)
         reason = st.text_area("更正／撤銷／復原原因", max_chars=500, height=96,
                               key="amend_reason_" + selected["id"])
         if st.form_submit_button("重算並預覽影響", disabled=disabled):
+            if market_group is not None and not market_matches(st, fields["ticker"], market_group):
+                return
             replacement = ({**fields, "action": initial["action"], "recorded_at": initial.get("recorded_at", "")}
                            if fields else None if mode == "撤銷紀錄" else selected["original"])
             stage(st, ledger, "amend", target_id=selected["id"], replacement=replacement, reason=reason)
@@ -1392,7 +1631,7 @@ def parse_snapshots(rows):
 
 
 def historical_state_fingerprint(state):
-    return digest({"cash": str(state["balance"]), "holdings": holdings(state),
+    return digest({"cash": str(state["balance"]), "holdings": serializable_holdings(holdings(state)),
                    "target": str(state["target"]) if state["target"] is not None else None,
                    "principal": str(net_principal(state)),
                    "cost": str(sum((lot["remaining_cost"] for lot in state["buys"]), money(0))),
@@ -1431,6 +1670,37 @@ def merged_snapshots(ledger, rows):
     return snapshots, errors
 
 
+def us_quote_matches_split(ticker, quote, state, day):
+    """An old close cannot price the new share count after a ledger split."""
+    try:
+        market_day = date.fromisoformat(quote["market_date"])
+        return not any(ticker_text(item["ticker"]) == ticker and market_day < trade_day(item["date"]) <= day
+                       for item in state["splits"])
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def checked_us_quote(ticker, result, state, captured):
+    def available_by(value):
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return stamp.tzinfo is not None and stamp <= captured
+
+    try:
+        usd_price, fx_rate = Decimal(str(result["usd_price"])), Decimal(str(result["fx_rate"]))
+        if (not usd_price.is_finite() or not fx_rate.is_finite() or
+                not 0 < usd_price <= Decimal("1000000000") or not 0 < fx_rate <= Decimal("1000")):
+            raise ValueError()
+        price = usd_price * fx_rate
+        if (price != Decimal(str(result["price"])) or not available_by(result["at"]) or
+                not available_by(result["fx_at"]) or date.fromisoformat(result["market_date"]) > captured.date() or
+                not us_quote_matches_split(ticker, result, state, captured.date())):
+            raise ValueError()
+        return price, {"usd_price": str(usd_price), "fx_rate": str(fx_rate),
+                       "market_date": result["market_date"], "fx_at": result["fx_at"]}
+    except (AttributeError, KeyError, ValueError, TypeError, InvalidOperation) as exc:
+        raise LedgerError("美股報價或匯率無效，保留原有快照。") from exc
+
+
 def build_daily_snapshot(ledger, prices, *, source="app", recorded_at=None):
     captured = snapshot_datetime(recorded_at)
     positions = holdings(ledger.state)
@@ -1440,13 +1710,17 @@ def build_daily_snapshot(ledger, prices, *, source="app", recorded_at=None):
         if not isinstance(result, dict):
             raise LedgerError("報價不完整，保留原有快照。")
         try:
-            price = money(result["price"])
+            details = {}
+            if is_us_ticker(ticker):
+                price, details = checked_us_quote(ticker, result, ledger.state, captured)
+            else:
+                price = money(result["price"])
             if price <= 0 or trade_day(result["at"]) > captured.date():
                 raise ValueError()
-        except (KeyError, ValueError, TypeError) as exc:
+        except (KeyError, ValueError, TypeError, InvalidOperation) as exc:
             raise LedgerError("報價無效，保留原有快照。") from exc
         quotes[ticker] = {"price": str(price), "at": str(result["at"]),
-                          "source": str(result.get("source", "未標示"))}
+                          "source": str(result.get("source", "未標示")), **details}
         validated_prices[ticker] = {**result, "price": price}
     market, assets = valuation(ledger.state, validated_prices)
     parts = profit_parts(ledger.state, validated_prices)
@@ -1455,7 +1729,7 @@ def build_daily_snapshot(ledger, prices, *, source="app", recorded_at=None):
                 "total_assets": str(assets), "cash_balance": str(ledger.state["balance"]),
                 "market_value": str(market), "target_price": str(ledger.state["target"]),
                 "net_principal": str(net_principal(ledger.state)), "profit": str(parts["total"]),
-                "ledger_revision": ledger.revision, "holdings": positions, "quotes": quotes}
+                "ledger_revision": ledger.revision, "holdings": serializable_holdings(positions), "quotes": quotes}
     snapshot["checksum"] = digest(snapshot)
     return snapshot
 
@@ -1524,8 +1798,7 @@ def snapshot_health(ledger, rows, *, at=None):
 
 
 def render_backfill(st, store, ledger, snapshot_rows, *, pending=False):
-    from history_backfill import backfill_missing_days, plan_backfill
-    from historical_prices import load_history
+    from history_backfill import backfill_missing_days, load_valuation_history, plan_backfill
     requested = st.button("補算缺漏日期", disabled=pending)
     if pending:
         st.caption("待確認的帳務處理完畢後，才會補算歷史資料。")
@@ -1537,7 +1810,7 @@ def render_backfill(st, store, ledger, snapshot_rows, *, pending=False):
         try:
             plan = plan_backfill(ledger, snapshot_rows)
             if plan["states"]:
-                loader = st.cache_data(ttl=60, max_entries=128, show_spinner=False)(load_history)
+                loader = st.cache_data(ttl=60, max_entries=128, show_spinner=False)(load_valuation_history)
                 cursor = st.session_state.get("history_backfill_cursor")
                 offset = cursor[1] if cursor and cursor[0] == store.spreadsheet.id else 0
                 with st.spinner("正在取得歷史收盤價並補算缺漏日期…"):
@@ -1609,7 +1882,7 @@ def render_history(st, store, ledger, prices, assets, parts, *, pending=False):
                 LOG.warning("Automatic snapshot unavailable (%s)", type(exc).__name__)
                 st.warning("今日快照尚未自動保存；原有快照仍保留。請稍後重新整理或按下方按鈕重試。")
         elif assets is None:
-            st.caption("目前報價不完整，暫不保存新快照；已保存的歷史資料保持原值。")
+            st.caption("目前報價不完整，暫不保存新快照；美股也需有效匯率。已保存的歷史資料保持原值。")
         snapshot_rows = render_backfill(st, store, ledger, snapshot_rows, pending=pending)
         snapshots, errors = merged_snapshots(ledger, snapshot_rows)
     health = snapshot_health(ledger, snapshot_rows or [])
@@ -1641,7 +1914,7 @@ def render_history(st, store, ledger, prices, assets, parts, *, pending=False):
         st.line_chart(pd.DataFrame(rows).set_index("日期"))
         reconstructed = sum(s.get("source") == "historical_backfill" for s in snapshots.values())
         if reconstructed:
-            st.caption(f"含 {reconstructed} 天「歷史補算」：依目前已登記／更正的交易與當日官方收盤價重建。實際快照保留當時數值；無法確認的歷史目標留空。")
+            st.caption(f"含 {reconstructed} 天「歷史補算」：依已登記的交易、估值時可取得的收盤價與匯率重建。實際快照保留當時數值；無法確認的歷史目標留空。")
         with st.expander("查看每日資料來源"):
             sources = {"app": "開啟／操作後保存", "manual": "手動快照", "github_actions": "背景排程", "historical_backfill": "歷史補算"}
             st.dataframe(pd.DataFrame([{"日期": day, "來源": sources.get(s.get("source"), "舊版快照"),
@@ -1719,7 +1992,7 @@ def render_data(st, store, ledger):
                 content = json.loads(upload.getvalue().decode("utf-8"))
                 preview = validate_backup(content)
                 st.success(f"備份回放通過：帳面現金 {amount_text(preview.state['balance'])}，有效事件 {len(preview.accepted)} 筆。")
-                st.json(holdings(preview.state))
+                st.json(serializable_holdings(holdings(preview.state)))
                 target_id = st.text_input("另一份空白試算表 ID", key="restore_target", width=600)
                 confirmed = st.checkbox("我已保存目前帳本備份，目的地是專供還原的空白試算表。")
                 if st.button("還原至該空白試算表", disabled=not confirmed or not target_id.strip()):
@@ -1734,7 +2007,7 @@ def render_data(st, store, ledger):
         if pending_upload and st.button("載入並查詢此操作"):
             try:
                 event = json.loads(pending_upload.getvalue().decode("utf-8"))
-                if event.get("schema_version") != 2 or event.get("event_hash") != digest({k: v for k, v in event.items() if k != "event_hash"}):
+                if event.get("schema_version") not in MODERN_SCHEMAS or event.get("event_hash") != digest({k: v for k, v in event.items() if k != "event_hash"}):
                     raise LedgerError("待確認檔案校驗失敗。")
                 if st.session_state.get("pending_event"):
                     raise LedgerError("已有待確認操作，請先處理。")
@@ -1787,9 +2060,16 @@ def render():
     quote = st.cache_data(ttl=300, show_spinner=False)(quote_uncached)
     with st.spinner("讀取參考收盤價…"):
         prices = {t: quote(t) for t in holdings(ledger.state)}
+        captured = datetime.now(TZ)
+        for ticker, result in prices.items():
+            if result and is_us_ticker(ticker):
+                try:
+                    checked_us_quote(ticker, result, ledger.state, captured)
+                except LedgerError:
+                    prices[ticker] = None
     missing = [t for t, q in prices.items() if q is None]
     if missing:
-        st.warning("報價不完整：" + "、".join(missing) + "。總市值與總損益暫不顯示；帳務仍可登記。")
+        st.warning("報價或匯率不完整：" + "、".join(missing) + "。總市值與總損益暫不顯示；帳務仍可登記。")
     stale = [t for t, q in prices.items() if q and (datetime.now(TZ).date() - trade_day(q["at"])).days > 4]
     if stale:
         st.warning("以下參考收盤價超過 4 個日曆日（可能為休市或停牌）：" + "、".join(stale))

@@ -8,11 +8,18 @@ from datetime import date, datetime, timedelta
 
 import app
 from historical_ledger import history_start, reconstruct_states
-from historical_prices import load_history
 
 VERSION = 1
 MAX_WINDOW_DAYS = 90
 LOG = logging.getLogger(__name__)
+
+
+def load_valuation_history(ticker, start, end):
+    if app.is_us_ticker(ticker):
+        from us_market import load_history
+    else:
+        from historical_prices import load_history
+    return load_history(ticker, start, end)
 
 
 def state_fingerprint(state):
@@ -72,6 +79,18 @@ def covered_between(start, end, coverage):
 
 
 def quote_for_day(history, ticker, day, state):
+    if app.is_us_ticker(ticker):
+        # US adapter pairs the completed close with FX for each Taipei
+        # valuation day, so a stock holiday can still have a new FX rate.
+        quote = history.get("quotes", {}).get(day.isoformat())
+        if not quote:
+            return None
+        try:
+            cutoff = datetime.combine(day, datetime.max.time(), tzinfo=app.TZ)
+            app.checked_us_quote(ticker, quote, state, cutoff)
+        except app.LedgerError:
+            return None
+        return quote
     eligible = []
     for text, quote in history.get("quotes", {}).items():
         try:
@@ -110,7 +129,7 @@ def build_historical_snapshot(ledger, state, day, prices, *, recorded_at=None):
 def backfill_missing_days(store, ledger, *, history_loader=None, at=None,
                           window_days=MAX_WINDOW_DAYS, budget_seconds=15, ticker_offset=0):
     """Re-read before writing, then reconcile all IDs even after a timeout."""
-    history_loader = load_history if history_loader is None else history_loader
+    history_loader = load_valuation_history if history_loader is None else history_loader
     captured = app.snapshot_datetime(at)
     rows = store.read_snapshots()
     plan = plan_backfill(ledger, rows, at=captured, window_days=window_days)

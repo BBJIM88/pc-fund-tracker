@@ -171,7 +171,7 @@ class LedgerCompatibilityTests(unittest.TestCase):
         for shares in (0, -1, 1.5, True, "NaN", "Infinity", None, 10**12 + 1):
             with self.subTest(shares=shares), self.assertRaises(app.LedgerError):
                 app.create_event(ledger, "set_existing_holding", ticker="2330.TW", shares=shares)
-        for ticker in ("2330", "AAPL", "2330.US", "<script>.TW", ""):
+        for ticker in ("2330", "AAPL/US", "2330.US", "<script>.TW", ""):
             with self.subTest(ticker=ticker), self.assertRaises(app.LedgerError):
                 app.create_event(ledger, "set_existing_holding", ticker=ticker, shares=1)
         self.assertEqual(ledger.state["existing_holdings"], {})

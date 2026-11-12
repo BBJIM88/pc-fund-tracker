@@ -44,7 +44,7 @@ def _legacy_state(ledger, effective):
     # legacy records must still exist here so their accepted delete can undo them.
     state = app.make_state(ledger.baseline, effective)
     for event in ledger.accepted:
-        if (event.get("schema_version") == 2
+        if (event.get("schema_version") in app.MODERN_SCHEMAS
                 or event["action"] in app.POSITION_ACTIONS | {"baseline", "amend", "snapshot"}):
             continue
         entry = effective.get(event["id"], event)
@@ -82,7 +82,7 @@ def _target_timeline(ledger, effective):
         entry = effective.get(event["id"], event)
         if entry is not None:
             timeline.append((app.trade_day(entry["date"]),
-                             2 if event.get("schema_version") == 2 else 1,
+                             2 if event.get("schema_version") in app.MODERN_SCHEMAS else 1,
                              sequence, app.money(entry["amount"])))
     return fallback, sorted(timeline, key=lambda row: row[:3])
 
@@ -112,7 +112,7 @@ def reconstruct_states(ledger, start, end, *, days=None) -> dict[date, dict]:
     state = _legacy_state(ledger, effective)
     timeline = []
     for sequence, event in enumerate(ledger.accepted):
-        if event.get("schema_version") != 2 or event["action"] not in FINANCIAL_ACTIONS:
+        if event.get("schema_version") not in app.MODERN_SCHEMAS or event["action"] not in FINANCIAL_ACTIONS:
             continue
         entry = effective.get(event["id"])
         if entry is not None:
