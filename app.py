@@ -23,9 +23,10 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.4.1"
 SHEET_NAME = "PC_Fund_Tracker"
 EVENTS_NAME = "Events"
 SNAPSHOTS_NAME = "Snapshots_v2"
@@ -1163,7 +1164,7 @@ def session_store(st):
     """Reuse one connection within this authenticated browser session only."""
     raw = st.secrets.get("GCP_KEY_JSON")
     credentials = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
-    key = digest({"credentials": credentials,
+    key = digest({"app_version": APP_VERSION, "credentials": credentials,
                   "spreadsheet_id": st.secrets.get("SPREADSHEET_ID"),
                   "baseline_id": st.secrets.get("BASELINE_WORKSHEET_ID"),
                   "baseline_title": st.secrets.get("BASELINE_WORKSHEET_NAME")})
@@ -1197,8 +1198,14 @@ def show_failure(st, exc, label="操作失敗"):
         st.error(f"{label}：{exc}")
     else:
         reference = uuid.uuid4().hex[:8]
-        LOG.error("%s reference=%s exception=%s", label, reference, type(exc).__name__)
-        st.error(f"{label}（參考碼 {reference}）。請檢查連線與 Secrets／試算表權限；原資料不會被清空。")
+        if isinstance(exc, AttributeError):
+            name = exc.name
+            safe_name = name if isinstance(name, str) and re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]{0,63}", name) else "-"
+            LOG.error("%s reference=%s exception=AttributeError attribute=%s", label, reference, safe_name)
+            st.error(f"{label}（參考碼 {reference}）。程式處理資料時發生錯誤；請重新啟動 App 後再試。")
+        else:
+            LOG.error("%s reference=%s exception=%s", label, reference, type(exc).__name__)
+            st.error(f"{label}（參考碼 {reference}）。請檢查連線與 Secrets／試算表權限；原資料不會被清空。")
         # A safe diagnostic, without displaying credentials or raw API responses.
         error_type = type(exc).__name__
         status = getattr(getattr(exc, "response", None), "status_code", None)
@@ -1642,6 +1649,20 @@ def historical_state_fingerprint(state):
                               for item in state["splits"]]})
 
 
+def history_core():
+    # Streamlit executes this file as __main__. A separately imported "app"
+    # can remain cached from an earlier deployment. Bind the current run's
+    # ledger operations explicitly instead of relying on that second module.
+    return SimpleNamespace(
+        TZ=TZ, datetime=datetime, MODERN_SCHEMAS=MODERN_SCHEMAS, POSITION_ACTIONS=POSITION_ACTIONS,
+        LedgerError=LedgerError, Conflict=Conflict, WriteUncertain=WriteUncertain,
+        apply_record=apply_record, make_state=make_state, trade_day=trade_day,
+        money=money, holdings=holdings, is_us_ticker=is_us_ticker, checked_us_quote=checked_us_quote,
+        snapshot_datetime=snapshot_datetime, build_daily_snapshot=build_daily_snapshot,
+        historical_state_fingerprint=historical_state_fingerprint, merged_snapshots=merged_snapshots,
+        parse_snapshots=parse_snapshots, digest=digest)
+
+
 def merged_snapshots(ledger, rows):
     snapshots = {day: {**values, "day": day, "legacy": True} for day, values in ledger.state["snapshots"].items()}
     records, errors = parse_snapshots(rows)
@@ -1660,7 +1681,7 @@ def merged_snapshots(ledger, rows):
     stale = {day for day, snapshot in historical.items() if snapshot.get("ledger_revision") != ledger.revision}
     if stale:
         from historical_ledger import reconstruct_states
-        states = reconstruct_states(ledger, min(stale), max(stale), days=stale)
+        states = reconstruct_states(ledger, min(stale), max(stale), days=stale, core=history_core())
         for day in stale:
             if day not in states or historical[day].get("state_fingerprint") != historical_state_fingerprint(states[day]):
                 snapshots.pop(day.isoformat(), None)
@@ -1808,13 +1829,16 @@ def render_backfill(st, store, ledger, snapshot_rows, *, pending=False):
     retry = attempt and attempt[0] == key and attempt[2].get("retry") and time.monotonic() - attempt[1] >= 60
     if requested or not attempt or attempt[0] != key or retry:
         try:
-            plan = plan_backfill(ledger, snapshot_rows)
+            core = history_core()
+            plan = plan_backfill(ledger, snapshot_rows, core=core)
             if plan["states"]:
                 loader = st.cache_data(ttl=60, max_entries=128, show_spinner=False)(load_valuation_history)
                 cursor = st.session_state.get("history_backfill_cursor")
                 offset = cursor[1] if cursor and cursor[0] == store.spreadsheet.id else 0
                 with st.spinner("正在取得歷史收盤價並補算缺漏日期…"):
-                    result = backfill_missing_days(store, ledger, history_loader=loader, ticker_offset=offset)
+                    result = backfill_missing_days(
+                        store, ledger, history_loader=lambda ticker, start, end: loader(ticker, start, end, _core=core),
+                        ticker_offset=offset, core=core)
                 st.session_state["history_backfill_cursor"] = (store.spreadsheet.id, result["next_offset"])
                 snapshot_rows = result["rows"]
                 remember_display(st, store, "snapshots", snapshot_rows)
@@ -1887,10 +1911,11 @@ def render_history(st, store, ledger, prices, assets, parts, *, pending=False):
         snapshots, errors = merged_snapshots(ledger, snapshot_rows)
     health = snapshot_health(ledger, snapshot_rows or [])
     latest = health["latest"]
+    unavailable_text = "暫時無法確認" if snapshot_rows is None else "尚無紀錄"
     updated = (snapshot_datetime(latest["recorded_at"]).strftime("%Y/%m/%d %H:%M:%S")
-               if latest and latest.get("recorded_at") else latest["day"] + "（舊版未記錄時間）" if latest else "尚無紀錄")
+               if latest and latest.get("recorded_at") else latest["day"] + "（舊版未記錄時間）" if latest else unavailable_text)
     st.metric("最新資產快照時間", updated)
-    st.caption("最新資料日期：" + latest["day"] if latest else "最新資料日期：尚無紀錄")
+    st.caption("最新資料日期：" + (latest["day"] if latest else unavailable_text))
     if health["background"]:
         background = health["background"]
         background_time = (snapshot_datetime(background["recorded_at"]).strftime("%Y/%m/%d %H:%M:%S")
@@ -1898,6 +1923,8 @@ def render_history(st, store, ledger, prices, assets, parts, *, pending=False):
         st.caption("背景排程最後成功：" + background_time + "（台灣時間）")
         if health["background_age_days"] > 2:
             st.warning(f"背景排程已 {health['background_age_days']} 天沒有成功紀錄，請到 GitHub Actions 檢查每日快照排程。")
+    elif snapshot_rows is None:
+        st.caption("背景每日排程：暫時無法確認。")
     else:
         st.caption("背景每日排程：尚未收到成功紀錄；開啟時自動補算也可獨立使用。")
     if st.session_state.get(notice_key):

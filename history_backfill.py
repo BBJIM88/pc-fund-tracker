@@ -5,37 +5,39 @@ import logging
 import time
 from dataclasses import replace
 from datetime import date, datetime, timedelta
+from functools import partial
 
-import app
-from historical_ledger import history_start, reconstruct_states
+from historical_ledger import _resolve_core, history_start, reconstruct_states
 
 VERSION = 1
 MAX_WINDOW_DAYS = 90
 LOG = logging.getLogger(__name__)
 
 
-def load_valuation_history(ticker, start, end):
-    if app.is_us_ticker(ticker):
+def load_valuation_history(ticker, start, end, *, _core=None):
+    core = _resolve_core(_core)
+    if core.is_us_ticker(ticker):
         from us_market import load_history
     else:
         from historical_prices import load_history
     return load_history(ticker, start, end)
 
 
-def state_fingerprint(state):
+def state_fingerprint(state, *, core=None):
     """Ignore journal revision changes which do not change this day's finances."""
-    return app.historical_state_fingerprint(state)
+    return _resolve_core(core).historical_state_fingerprint(state)
 
 
-def plan_backfill(ledger, rows, *, at=None, window_days=MAX_WINDOW_DAYS):
+def plan_backfill(ledger, rows, *, at=None, window_days=MAX_WINDOW_DAYS, core=None):
+    core = _resolve_core(core)
     if not 1 <= window_days <= MAX_WINDOW_DAYS:
         raise ValueError("Invalid historical window.")
-    end = app.snapshot_datetime(at).date() - timedelta(days=1)
-    start = history_start(ledger)
+    end = core.snapshot_datetime(at).date() - timedelta(days=1)
+    start = history_start(ledger, core=core)
     result = {"states": {}, "remaining": 0, "start": start}
     if start is None or start > end:
         return result
-    snapshots, _ = app.merged_snapshots(ledger, rows)
+    snapshots, _ = core.merged_snapshots(ledger, rows)
     existing = {date.fromisoformat(day): snapshot for day, snapshot in snapshots.items()
                 if start <= date.fromisoformat(day) <= end}
     missing = [start + timedelta(days=offset) for offset in range((end - start).days + 1)
@@ -49,10 +51,10 @@ def plan_backfill(ledger, rows, *, at=None, window_days=MAX_WINDOW_DAYS):
     days = set(recent_missing) | reconstructed
     if not days:
         return result
-    states = reconstruct_states(ledger, min(days), max(days), days=days)
+    states = reconstruct_states(ledger, min(days), max(days), days=days, core=core)
     changed = {day for day in reconstructed if day in states and
                (existing[day].get("reconstruction_version") != VERSION or
-                existing[day].get("state_fingerprint") != state_fingerprint(states[day]))}
+                existing[day].get("state_fingerprint") != state_fingerprint(states[day], core=core))}
     needed = set(missing) | changed
     if not needed:
         return result
@@ -78,24 +80,25 @@ def covered_between(start, end, coverage):
     return False
 
 
-def quote_for_day(history, ticker, day, state):
-    if app.is_us_ticker(ticker):
+def quote_for_day(history, ticker, day, state, *, core=None):
+    core = _resolve_core(core)
+    if core.is_us_ticker(ticker):
         # US adapter pairs the completed close with FX for each Taipei
         # valuation day, so a stock holiday can still have a new FX rate.
         quote = history.get("quotes", {}).get(day.isoformat())
         if not quote:
             return None
         try:
-            cutoff = datetime.combine(day, datetime.max.time(), tzinfo=app.TZ)
-            app.checked_us_quote(ticker, quote, state, cutoff)
-        except app.LedgerError:
+            cutoff = datetime.combine(day, datetime.max.time(), tzinfo=core.TZ)
+            core.checked_us_quote(ticker, quote, state, cutoff)
+        except core.LedgerError:
             return None
         return quote
     eligible = []
     for text, quote in history.get("quotes", {}).items():
         try:
-            quoted_day = app.trade_day(quote["at"])
-            if app.trade_day(text) != quoted_day or quoted_day > day or app.money(quote["price"]) <= 0:
+            quoted_day = core.trade_day(quote["at"])
+            if core.trade_day(text) != quoted_day or quoted_day > day or core.money(quote["price"]) <= 0:
                 continue
             eligible.append((quoted_day, quote))
         except (ValueError, KeyError, TypeError):
@@ -105,34 +108,37 @@ def quote_for_day(history, ticker, day, state):
     quoted_day, quote = max(eligible, key=lambda item: item[0])
     if not covered_between(quoted_day, day, history.get("coverage", [])):
         return None
-    if any(item["ticker"] == ticker and quoted_day < app.trade_day(item["date"]) <= day
+    if any(item["ticker"] == ticker and quoted_day < core.trade_day(item["date"]) <= day
            for item in state["splits"]):
         return None
     return quote
 
 
-def build_historical_snapshot(ledger, state, day, prices, *, recorded_at=None):
-    if day >= app.snapshot_datetime(recorded_at).date():
-        raise app.LedgerError("歷史補算只處理已結束的日期。")
-    proxy = replace(ledger, state={**state, "target": state["target"] or app.money(0)})
-    snapshot = app.build_daily_snapshot(proxy, prices, source="historical_backfill",
-        recorded_at=datetime.combine(day, datetime.max.time(), tzinfo=app.TZ))
-    snapshot["recorded_at"] = app.snapshot_datetime(recorded_at).isoformat(timespec="microseconds")
+def build_historical_snapshot(ledger, state, day, prices, *, recorded_at=None, core=None):
+    core = _resolve_core(core)
+    if day >= core.snapshot_datetime(recorded_at).date():
+        raise core.LedgerError("歷史補算只處理已結束的日期。")
+    proxy = replace(ledger, state={**state, "target": state["target"] or core.money(0)})
+    snapshot = core.build_daily_snapshot(proxy, prices, source="historical_backfill",
+        recorded_at=datetime.combine(day, datetime.max.time(), tzinfo=core.TZ))
+    snapshot["recorded_at"] = core.snapshot_datetime(recorded_at).isoformat(timespec="microseconds")
     snapshot["reconstruction_version"] = VERSION
-    snapshot["state_fingerprint"] = state_fingerprint(state)
+    snapshot["state_fingerprint"] = state_fingerprint(state, core=core)
     if state["target"] is None:
         snapshot.pop("target_price", None)
-    snapshot["checksum"] = app.digest({key: value for key, value in snapshot.items() if key != "checksum"})
+    snapshot["checksum"] = core.digest({key: value for key, value in snapshot.items() if key != "checksum"})
     return snapshot
 
 
 def backfill_missing_days(store, ledger, *, history_loader=None, at=None,
-                          window_days=MAX_WINDOW_DAYS, budget_seconds=15, ticker_offset=0):
+                          window_days=MAX_WINDOW_DAYS, budget_seconds=15, ticker_offset=0, core=None):
     """Re-read before writing, then reconcile all IDs even after a timeout."""
-    history_loader = load_valuation_history if history_loader is None else history_loader
-    captured = app.snapshot_datetime(at)
+    core = _resolve_core(core)
+    if history_loader is None:
+        history_loader = partial(load_valuation_history, _core=core)
+    captured = core.snapshot_datetime(at)
     rows = store.read_snapshots()
-    plan = plan_backfill(ledger, rows, at=captured, window_days=window_days)
+    plan = plan_backfill(ledger, rows, at=captured, window_days=window_days, core=core)
     states = plan["states"]
     result = {"rows": rows, "written": 0, "unavailable": 0, "remaining": plan["remaining"],
               "start": plan["start"], "next_offset": 0}
@@ -140,7 +146,7 @@ def backfill_missing_days(store, ledger, *, history_loader=None, at=None,
         return result
     required = {}
     for day, state in states.items():
-        for ticker in app.holdings(state):
+        for ticker in core.holdings(state):
             required.setdefault(ticker, []).append(day)
     histories = {}
     started = time.monotonic()
@@ -160,18 +166,18 @@ def backfill_missing_days(store, ledger, *, history_loader=None, at=None,
         result["next_offset"] = (offset + attempted) % len(ordered)
     pending = []
     for day, state in states.items():
-        prices = {ticker: quote_for_day(histories.get(ticker, {}), ticker, day, state)
-                  for ticker in app.holdings(state)}
+        prices = {ticker: quote_for_day(histories.get(ticker, {}), ticker, day, state, core=core)
+                  for ticker in core.holdings(state)}
         if any(quote is None for quote in prices.values()):
             result["unavailable"] += 1
             continue
-        pending.append(build_historical_snapshot(ledger, state, day, prices, recorded_at=captured))
+        pending.append(build_historical_snapshot(ledger, state, day, prices, recorded_at=captured, core=core))
     if not pending:
         return result
     if store.read().revision != ledger.revision:
-        raise app.Conflict("帳本已更新，歷史補算暫停；請重新整理後再試。")
+        raise core.Conflict("帳本已更新，歷史補算暫停；請重新整理後再試。")
     rows = store.read_snapshots()
-    effective, _ = app.merged_snapshots(ledger, rows)
+    effective, _ = core.merged_snapshots(ledger, rows)
     pending = [snapshot for snapshot in pending if snapshot["day"] not in effective or
                (effective[snapshot["day"]].get("source") == "historical_backfill" and
                 (effective[snapshot["day"]].get("reconstruction_version") != VERSION or
@@ -187,13 +193,13 @@ def backfill_missing_days(store, ledger, *, history_loader=None, at=None,
         pass
     try:
         checked_rows = store.read_snapshots()
-        confirmed = {(item.get("id"), item.get("checksum")) for item in app.parse_snapshots(checked_rows)[0]}
+        confirmed = {(item.get("id"), item.get("checksum")) for item in core.parse_snapshots(checked_rows)[0]}
         if not expected <= confirmed:
-            raise app.WriteUncertain("歷史補算保存結果尚未完整確認；請稍後重新整理查詢。")
-    except app.WriteUncertain:
+            raise core.WriteUncertain("歷史補算保存結果尚未完整確認；請稍後重新整理查詢。")
+    except core.WriteUncertain:
         raise
     except Exception as exc:
-        raise app.WriteUncertain("歷史補算已送出，尚未確認保存結果；請稍後重新整理查詢。") from exc
+        raise core.WriteUncertain("歷史補算已送出，尚未確認保存結果；請稍後重新整理查詢。") from exc
     result["rows"] = checked_rows
     result["written"] = len(pending)
     return result
