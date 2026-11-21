@@ -26,7 +26,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.5.1"
 SHEET_NAME = "PC_Fund_Tracker"
 EVENTS_NAME = "Events"
 SNAPSHOTS_NAME = "Snapshots_v2"
@@ -769,9 +769,14 @@ class SheetStore:
 
     def for_book(self, book):
         if book["id"] == self.ledger_id:
+            self.ledger_name = book["name"]
+            if self.book:
+                self.book = book
             return self
         if book["id"] == "main":
-            return type(self)(self.spreadsheet, client=self.client)
+            store = type(self)(self.spreadsheet, client=self.client)
+            store.ledger_name = book["name"]
+            return store
         return type(self)(self.spreadsheet, client=self.client, book=book)
 
     def list_books(self):
@@ -1248,7 +1253,8 @@ def check_event_book(store, event):
 
 
 def select_book(st, book_id):
-    if st.session_state.get("pending_event") or st.query_params.get("pending") or st.session_state.get("create_book_pending"):
+    if (st.session_state.get("pending_event") or st.query_params.get("pending") or
+            st.session_state.get("create_book_pending") or st.session_state.get("rename_book_pending")):
         raise LedgerError("請先處理待確認操作，再切換帳本。")
     # Authentication and the selected ID are the only state shared by ledgers.
     for key in list(st.session_state):
@@ -1260,17 +1266,19 @@ def select_book(st, book_id):
 
 
 def render_book_selector(st, store):
-    from ledger_books import book_name, create_book
+    from ledger_books import book_name, book_revision, create_book, rename_book
     books = read_display(st, store, "book_catalogue", store.list_books, ttl=30)
     by_id = {book["id"]: book for book in books}
     if store.ledger_id not in by_id:
         raise LedgerError("選取的帳本不在目錄中，請檢查帳本設定。")
+    store.for_book(by_id[store.ledger_id])
     pending = bool(st.session_state.get("pending_event") or st.query_params.get("pending"))
+    renaming = st.session_state.get("rename_book_pending")
     with st.sidebar:
         selected = st.selectbox("目前帳本", list(by_id), index=list(by_id).index(store.ledger_id),
                                 format_func=lambda key: by_id[key]["name"] +
                                 ("（" + key[:6] + "）" if sum(b["name"] == by_id[key]["name"] for b in books) > 1 else ""),
-                                key="ledger_picker", disabled=pending or bool(st.session_state.get("create_book_pending")))
+                                key="ledger_picker", disabled=pending or bool(st.session_state.get("create_book_pending")) or bool(renaming))
         if selected != store.ledger_id:
             select_book(st, selected)
         st.caption("各帳本的現金、庫存、紀錄與走勢分開計算。")
@@ -1280,7 +1288,7 @@ def render_book_selector(st, store):
                 st.caption("正在確認建立結果：" + operation["name"] + "。請按「建立空白帳本」重試同一個操作。")
             with st.form("create_ledger", clear_on_submit=False):
                 name = st.text_input("新帳本名稱", max_chars=40, key="new_book_name", disabled=bool(operation))
-                create = st.form_submit_button("建立空白帳本", disabled=pending)
+                create = st.form_submit_button("建立空白帳本", disabled=pending or bool(renaming))
             if create:
                 try:
                     if not operation:
@@ -1297,6 +1305,36 @@ def render_book_selector(st, store):
                     st.error(str(exc))
                 except Exception as exc:
                     show_failure(st, exc, "新帳本建立結果尚未確認")
+        with st.expander("重新命名目前帳本"):
+            locked = pending or bool(st.session_state.get("create_book_pending"))
+            if renaming:
+                st.caption("正在確認重新命名結果，請按「儲存帳本名稱」重試同一個操作。")
+            with st.form("rename_ledger"):
+                new_name = st.text_input("新的帳本名稱", value=store.ledger_name, max_chars=40,
+                                         key="rename_book_name_" + store.ledger_id, disabled=locked or bool(renaming))
+                submitted = st.form_submit_button("儲存帳本名稱", disabled=locked)
+            if submitted:
+                try:
+                    if not renaming:
+                        renaming = {"id": uuid.uuid4().hex, "book_id": store.ledger_id,
+                                    "name": book_name(new_name, core=book_core()),
+                                    "expected_revision": book_revision(by_id[store.ledger_id], core=book_core())}
+                        st.session_state["rename_book_pending"] = renaming
+                    renamed = rename_book(store.spreadsheet, renaming["book_id"], renaming["name"],
+                                          operation_id=renaming["id"], expected_revision=renaming["expected_revision"],
+                                          core=book_core())
+                    st.session_state.pop("rename_book_pending", None)
+                    for key in ("_sheet_connection", "_display_cache", "backup_bytes", "backup_revision",
+                                "rename_book_name_" + store.ledger_id):
+                        st.session_state.pop(key, None)
+                    st.session_state["flash"] = "帳本已重新命名為：" + renamed["name"]
+                    st.rerun()
+                except LedgerError as exc:
+                    st.session_state.pop("rename_book_pending", None)
+                    st.session_state.get("_display_cache", {}).pop("book_catalogue", None)
+                    st.error(str(exc))
+                except Exception as exc:
+                    show_failure(st, exc, "重新命名結果尚未確認")
     return store
 
 
@@ -2143,6 +2181,10 @@ def restore_to_empty_spreadsheet(source_store, target_spreadsheet, content):
     if restored_book:
         from ledger_books import publish_book
         publish_book(target_spreadsheet, restored_book, core=book_core())
+    elif content.get("ledger_name") and content["ledger_name"] != "原本帳本":
+        from ledger_books import rename_book
+        renamed = rename_book(target_spreadsheet, "main", content["ledger_name"], core=book_core())
+        target.ledger_name = renamed["name"]
     return target
 
 
@@ -2244,6 +2286,7 @@ def render():
         store = session_store(st)
         store = render_book_selector(st, store)
         ledger = read_display(st, store, "ledger", store.read, ttl=15)
+        ledger.ledger_name = store.ledger_name
     except Exception as exc:
         show_failure(st, exc, "帳本無法載入，已停止操作")
         st.caption("若有損壞，先從 Google Sheets 下載原始工作表備份，再依錯誤列號檢查。勿清空 A1 或 Events。")
