@@ -37,6 +37,9 @@ class FakeWorksheet:
     def append_rows(self, rows, **kwargs):
         self.rows.extend(deepcopy(rows))
 
+    def update(self, values, **kwargs):
+        self.rows = deepcopy(values)
+
 
 class FakeSpreadsheet:
     def __init__(self, raw="", events=None):

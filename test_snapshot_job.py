@@ -139,7 +139,7 @@ class RunnerTests(unittest.TestCase):
         for written, expected in ((True, "written"), (False, "unchanged")):
             stdout, stderr = io.StringIO(), io.StringIO()
             with patch.object(snapshot_job, "store_from_environment"), \
-                    patch.object(snapshot_job, "run_snapshot_job", return_value=self.result(written)), \
+                    patch.object(snapshot_job, "run_all_snapshot_jobs", return_value={"results": [self.result(written)], "errors": []}), \
                     contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
                 self.assertEqual(snapshot_job.main(), 0)
             self.assertEqual(stdout.getvalue(), f"2026-10-21 {expected}\n")

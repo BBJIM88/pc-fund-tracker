@@ -26,7 +26,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
-APP_VERSION = "2.4.1"
+APP_VERSION = "2.5.0"
 SHEET_NAME = "PC_Fund_Tracker"
 EVENTS_NAME = "Events"
 SNAPSHOTS_NAME = "Snapshots_v2"
@@ -524,6 +524,8 @@ class Ledger:
     warnings: list
     source_spreadsheet_id: str | None = None
     baseline_worksheet_id: int | None = None
+    source_ledger_id: str | None = None
+    ledger_name: str | None = None
 
 
 def load_bundle(raw_baseline, events):
@@ -649,6 +651,8 @@ def create_event(ledger, action, *, operation_id=None, **fields):
              "expected_revision": ledger.revision}
     if ledger.source_spreadsheet_id:
         event["source_spreadsheet_id"] = ledger.source_spreadsheet_id
+    if ledger.source_ledger_id:
+        event["source_ledger_id"] = ledger.source_ledger_id
     event["event_hash"] = digest(event)
     trial = load_bundle(ledger.raw_baseline, ledger.events + [event])
     result = trial.statuses[event["id"]]
@@ -695,6 +699,9 @@ def backup_document(ledger, *, spreadsheet_id, baseline_worksheet_id, snapshot_r
                "baseline_worksheet_id": baseline_worksheet_id,
                "raw_baseline": ledger.raw_baseline, "events": ledger.events,
                "snapshot_rows": snapshot_rows or [], "ledger_revision": ledger.revision}
+    if ledger.source_ledger_id:
+        content["source_ledger_id"] = ledger.source_ledger_id
+        content["ledger_name"] = ledger.ledger_name
     content["checksum"] = digest(content)
     return content
 
@@ -707,6 +714,13 @@ def validate_backup(content):
     ledger = load_bundle(content["raw_baseline"], content["events"])
     if ledger.revision != content.get("ledger_revision"):
         raise LedgerError("備份回放後的帳本版本不符。")
+    ledger_id = content.get("source_ledger_id", "main")
+    if ledger_id != "main" and not re.fullmatch(r"[0-9a-f]{32}", str(ledger_id)):
+        raise LedgerError("備份的帳本識別碼無效。")
+    if any(e.get("source_ledger_id", ledger_id) != ledger_id for e in ledger.events):
+        raise LedgerError("備份包含其他帳本的事件。")
+    ledger.source_ledger_id = ledger_id
+    ledger.ledger_name = content.get("ledger_name", "原本帳本")
     return ledger
 
 
@@ -740,14 +754,40 @@ class SheetStore:
     must use this protocol; manual edits/sorts and old writers are unsupported.
     """
 
-    def __init__(self, spreadsheet, *, baseline_id=None, baseline_title=None, client=None):
+    def __init__(self, spreadsheet, *, baseline_id=None, baseline_title=None, client=None, book=None):
         self.spreadsheet = spreadsheet
-        self.baseline_id = baseline_id
+        self.book = book
+        self.ledger_id = book["id"] if book else "main"
+        self.ledger_name = book["name"] if book else "原本帳本"
+        self.baseline_id = book["baseline_id"] if book else baseline_id
         self.baseline_title = baseline_title
         self.client = client
 
+    @property
+    def context_key(self):
+        return self.spreadsheet.id + ":" + self.ledger_id
+
+    def for_book(self, book):
+        if book["id"] == self.ledger_id:
+            return self
+        if book["id"] == "main":
+            return type(self)(self.spreadsheet, client=self.client)
+        return type(self)(self.spreadsheet, client=self.client, book=book)
+
+    def list_books(self):
+        from ledger_books import list_books
+        return list_books(self.spreadsheet, core=book_core())
+
     def worksheet(self, title, *, create=False):
         import gspread
+        if self.book:
+            key = {EVENTS_NAME: "events_id", SNAPSHOTS_NAME: "snapshots_id"}.get(title)
+            if key is None:
+                raise LedgerError("新帳本工作表類型無效。")
+            sheet = self.spreadsheet.get_worksheet_by_id(self.book[key])
+            if sheet is None:
+                raise LedgerError("此帳本的工作表不存在，請檢查分頁是否被刪除。")
+            return sheet
         try:
             return self.spreadsheet.worksheet(title)
         except gspread.WorksheetNotFound:
@@ -774,7 +814,12 @@ class SheetStore:
             baseline_ws = self.spreadsheet.worksheet(self.baseline_title)
         else:
             # Resolve by saved content, not by tab ordering. Never assume an empty A1 means data was lost safely.
-            sheets = [s for s in self.spreadsheet.worksheets() if s.title not in {EVENTS_NAME, SNAPSHOTS_NAME}]
+            from ledger_books import CATALOGUE, PREFIX
+            reserved = {value for book in self.list_books() if book["id"] != "main"
+                        for key, value in book.items() if key in {"baseline_id", "events_id", "snapshots_id"}}
+            sheets = [s for s in self.spreadsheet.worksheets()
+                      if s.title not in {EVENTS_NAME, SNAPSHOTS_NAME, CATALOGUE}
+                      and not s.title.startswith(PREFIX) and s.id not in reserved]
             expected = {e["baseline_hash"] for e in markers}
             candidates = []
             for s in sheets:
@@ -794,13 +839,25 @@ class SheetStore:
         if baseline_ws is None or baseline_ws.title in {EVENTS_NAME, SNAPSHOTS_NAME}:
             raise LedgerError("基準工作表不存在或指向事件工作表。")
         raw = baseline_ws.acell("A1").value or ""
+        if self.book and parse_baseline(raw).get("ledger_id") != self.ledger_id:
+            raise LedgerError("新帳本的基準資料與識別碼不符。")
+        for event in events:
+            binding = event.get("source_ledger_id")
+            if binding is not None and binding != self.ledger_id:
+                raise LedgerError("事件包含其他帳本的紀錄，已停止操作。")
+            if self.book and event.get("action") != "baseline" and binding != self.ledger_id:
+                raise LedgerError("新帳本事件缺少帳本識別碼，已停止操作。")
         ledger = load_bundle(raw, events)
         self.baseline_id = baseline_ws.id
         ledger.source_spreadsheet_id = self.spreadsheet.id
         ledger.baseline_worksheet_id = baseline_ws.id
+        ledger.source_ledger_id = self.ledger_id
+        ledger.ledger_name = self.ledger_name
         return ledger
 
     def append(self, event):
+        if event.get("action") != "baseline":
+            check_event_book(self, event)
         self.worksheet(EVENTS_NAME, create=True).append_row([canonical(event)], value_input_option="RAW",
                                                           insert_data_option="INSERT_ROWS")
 
@@ -814,14 +871,26 @@ class SheetStore:
 
     def read_snapshots(self):
         ws = self.worksheet(SNAPSHOTS_NAME)
-        return ws.get_all_values() if ws else []
+        rows = ws.get_all_values() if ws else []
+        for row in rows:
+            try:
+                snapshot = json.loads(row[0])
+            except (ValueError, TypeError, IndexError):
+                continue
+            if isinstance(snapshot, dict) and (snapshot.get("ledger_id", "main") != self.ledger_id):
+                raise LedgerError("快照包含其他帳本的資料，請保留原工作表並檢查。")
+        return rows
 
     def append_snapshot(self, snapshot):
+        if snapshot.get("ledger_id", "main") != self.ledger_id:
+            raise LedgerError("快照不屬於目前帳本，已停止保存。")
         self.worksheet(SNAPSHOTS_NAME, create=True).append_row([canonical(snapshot)], value_input_option="RAW",
                                                              insert_data_option="INSERT_ROWS")
 
     def append_snapshots(self, snapshots):
         if snapshots:
+            if any(s.get("ledger_id", "main") != self.ledger_id for s in snapshots):
+                raise LedgerError("批次快照包含其他帳本的資料，已停止保存。")
             self.worksheet(SNAPSHOTS_NAME, create=True).append_rows(
                 [[canonical(snapshot)] for snapshot in snapshots], value_input_option="RAW",
                 insert_data_option="INSERT_ROWS")
@@ -829,6 +898,7 @@ class SheetStore:
 
 def write_pending(store, event):
     """Always reconcile before retrying. Append is never blindly retried."""
+    check_event_book(store, event)
     source_id = event.get("source_spreadsheet_id")
     if source_id and source_id != store.spreadsheet.id:
         raise LedgerError("這份待確認操作來自另一份試算表；請切回原帳本後查詢。")
@@ -1160,17 +1230,93 @@ def connect_store(st):
                       baseline_title=st.secrets.get("BASELINE_WORKSHEET_NAME"), client=client)
 
 
+def book_core():
+    return SimpleNamespace(LedgerError=LedgerError, WriteUncertain=WriteUncertain, digest=digest,
+                           canonical=canonical, default_data=default_data, parse_baseline=parse_baseline)
+
+
+def active_book_id(st):
+    value = st.query_params.get("ledger", st.session_state.get("active_ledger_id", "main")) if hasattr(st, "query_params") else st.session_state.get("active_ledger_id", "main")
+    if value != "main" and (not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value)):
+        raise LedgerError("帳本識別碼無效。")
+    return value
+
+
+def check_event_book(store, event):
+    if event.get("source_ledger_id", "main") != getattr(store, "ledger_id", "main"):
+        raise LedgerError("這筆操作屬於另一個帳本，請切換到原帳本後再處理。")
+
+
+def select_book(st, book_id):
+    if st.session_state.get("pending_event") or st.query_params.get("pending") or st.session_state.get("create_book_pending"):
+        raise LedgerError("請先處理待確認操作，再切換帳本。")
+    # Authentication and the selected ID are the only state shared by ledgers.
+    for key in list(st.session_state):
+        if key not in {"auth_signature", "last_active", "ledger_picker"}:
+            del st.session_state[key]
+    st.session_state["active_ledger_id"] = book_id
+    st.query_params["ledger"] = book_id
+    st.rerun()
+
+
+def render_book_selector(st, store):
+    from ledger_books import book_name, create_book
+    books = read_display(st, store, "book_catalogue", store.list_books, ttl=30)
+    by_id = {book["id"]: book for book in books}
+    if store.ledger_id not in by_id:
+        raise LedgerError("選取的帳本不在目錄中，請檢查帳本設定。")
+    pending = bool(st.session_state.get("pending_event") or st.query_params.get("pending"))
+    with st.sidebar:
+        selected = st.selectbox("目前帳本", list(by_id), index=list(by_id).index(store.ledger_id),
+                                format_func=lambda key: by_id[key]["name"] +
+                                ("（" + key[:6] + "）" if sum(b["name"] == by_id[key]["name"] for b in books) > 1 else ""),
+                                key="ledger_picker", disabled=pending or bool(st.session_state.get("create_book_pending")))
+        if selected != store.ledger_id:
+            select_book(st, selected)
+        st.caption("各帳本的現金、庫存、紀錄與走勢分開計算。")
+        with st.expander("建立新帳本"):
+            operation = st.session_state.get("create_book_pending")
+            if operation:
+                st.caption("正在確認建立結果：" + operation["name"] + "。請按「建立空白帳本」重試同一個操作。")
+            with st.form("create_ledger", clear_on_submit=False):
+                name = st.text_input("新帳本名稱", max_chars=40, key="new_book_name", disabled=bool(operation))
+                create = st.form_submit_button("建立空白帳本", disabled=pending)
+            if create:
+                try:
+                    if not operation:
+                        operation = {"id": uuid.uuid4().hex, "name": book_name(name, core=book_core())}
+                        st.session_state["create_book_pending"] = operation
+                    book = create_book(store.spreadsheet, operation["name"], operation_id=operation["id"], core=book_core())
+                    st.session_state.pop("create_book_pending", None)
+                    # Clear the picker widget before its next run so it uses
+                    # the new active ledger rather than the previous selection.
+                    st.session_state.pop("ledger_picker", None)
+                    select_book(st, book["id"])
+                except LedgerError as exc:
+                    st.session_state.pop("create_book_pending", None)
+                    st.error(str(exc))
+                except Exception as exc:
+                    show_failure(st, exc, "新帳本建立結果尚未確認")
+    return store
+
+
 def session_store(st):
     """Reuse one connection within this authenticated browser session only."""
     raw = st.secrets.get("GCP_KEY_JSON")
     credentials = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
-    key = digest({"app_version": APP_VERSION, "credentials": credentials,
+    selected = active_book_id(st)
+    key = digest({"app_version": APP_VERSION, "ledger_id": selected, "credentials": credentials,
                   "spreadsheet_id": st.secrets.get("SPREADSHEET_ID"),
                   "baseline_id": st.secrets.get("BASELINE_WORKSHEET_ID"),
                   "baseline_title": st.secrets.get("BASELINE_WORKSHEET_NAME")})
     connection = st.session_state.get("_sheet_connection")
     if connection is None or connection[0] != key:
         store = connect_store(st)
+        if selected != "main":
+            book = next((book for book in store.list_books() if book["id"] == selected), None)
+            if book is None:
+                raise LedgerError("找不到指定帳本；請確認網址的 ledger 識別碼。")
+            store = store.for_book(book)
         st.session_state["_sheet_connection"] = (key, store)
         st.session_state.pop("_display_cache", None)
         return store
@@ -1561,7 +1707,8 @@ def render_records(st, ledger):
                      "備註": e.get("note", "")})
     rows.sort(key=lambda row: row["交易日期"], reverse=True)
     dataframe(st, rows, money_columns=("應付／實收／金額",), usd_columns=("美元成交單價",))
-    st.download_button("匯出全部紀錄 CSV", records_csv(ledger), file_name="tracker_records.csv", mime="text/csv")
+    st.download_button("匯出全部紀錄 CSV", records_csv(ledger),
+                       file_name="tracker_records_" + (ledger.source_ledger_id or "main") + ".csv", mime="text/csv")
     st.caption("CSV 供對帳；完整還原請使用資料管理頁的 JSON 備份。舊版賣出費用欄已包含當時合併輸入的交易費用。")
 
 
@@ -1751,6 +1898,8 @@ def build_daily_snapshot(ledger, prices, *, source="app", recorded_at=None):
                 "market_value": str(market), "target_price": str(ledger.state["target"]),
                 "net_principal": str(net_principal(ledger.state)), "profit": str(parts["total"]),
                 "ledger_revision": ledger.revision, "holdings": serializable_holdings(positions), "quotes": quotes}
+    if ledger.source_ledger_id:
+        snapshot["ledger_id"] = ledger.source_ledger_id
     snapshot["checksum"] = digest(snapshot)
     return snapshot
 
@@ -1824,7 +1973,7 @@ def render_backfill(st, store, ledger, snapshot_rows, *, pending=False):
     if pending:
         st.caption("待確認的帳務處理完畢後，才會補算歷史資料。")
         return snapshot_rows
-    key = (store.spreadsheet.id, ledger.revision, datetime.now(TZ).date().isoformat())
+    key = (store.context_key, ledger.revision, datetime.now(TZ).date().isoformat())
     attempt = st.session_state.get("history_backfill_attempt")
     retry = attempt and attempt[0] == key and attempt[2].get("retry") and time.monotonic() - attempt[1] >= 60
     if requested or not attempt or attempt[0] != key or retry:
@@ -1834,12 +1983,12 @@ def render_backfill(st, store, ledger, snapshot_rows, *, pending=False):
             if plan["states"]:
                 loader = st.cache_data(ttl=60, max_entries=128, show_spinner=False)(load_valuation_history)
                 cursor = st.session_state.get("history_backfill_cursor")
-                offset = cursor[1] if cursor and cursor[0] == store.spreadsheet.id else 0
+                offset = cursor[1] if cursor and cursor[0] == store.context_key else 0
                 with st.spinner("正在取得歷史收盤價並補算缺漏日期…"):
                     result = backfill_missing_days(
                         store, ledger, history_loader=lambda ticker, start, end: loader(ticker, start, end, _core=core),
                         ticker_offset=offset, core=core)
-                st.session_state["history_backfill_cursor"] = (store.spreadsheet.id, result["next_offset"])
+                st.session_state["history_backfill_cursor"] = (store.context_key, result["next_offset"])
                 snapshot_rows = result["rows"]
                 remember_display(st, store, "snapshots", snapshot_rows)
             else:
@@ -1881,7 +2030,7 @@ def render_history(st, store, ledger, prices, assets, parts, *, pending=False):
         show_failure(st, exc, "快照讀取失敗")
         snapshot_rows = None
         snapshots, errors = merged_snapshots(ledger, [])
-    book_id = store.spreadsheet.id
+    book_id = store.context_key
     today = datetime.now(TZ).date().isoformat()
     notice_key = f"snapshot_gap_{book_id}_{today}"
     if snapshot_rows is not None:
@@ -1968,9 +2117,17 @@ def restore_to_empty_spreadsheet(source_store, target_spreadsheet, content):
     sheets = target_spreadsheet.worksheets()
     if not sheets or any(any(cell for row in s.get_all_values() for cell in row) for s in sheets):
         raise LedgerError("目的地試算表必須完全空白；含任何資料都不會覆蓋。")
-    baseline_ws = sheets[0]
-    baseline_ws.update([[content["raw_baseline"]]], range_name="A1", value_input_option="RAW")
-    target = SheetStore(target_spreadsheet, baseline_id=baseline_ws.id, client=source_store.client)
+    restored_book = None
+    if content.get("source_ledger_id", "main") != "main":
+        from ledger_books import prepare_book
+        restored_book = prepare_book(target_spreadsheet, content.get("ledger_name") or "還原帳本",
+                                     content["source_ledger_id"], raw_baseline=content["raw_baseline"], core=book_core())
+        target = SheetStore(target_spreadsheet, client=source_store.client, book=restored_book)
+        baseline_ws = target_spreadsheet.get_worksheet_by_id(restored_book["baseline_id"])
+    else:
+        baseline_ws = sheets[0]
+        baseline_ws.update([[content["raw_baseline"]]], range_name="A1", value_input_option="RAW")
+        target = SheetStore(target_spreadsheet, baseline_id=baseline_ws.id, client=source_store.client)
     # Sheet IDs change on restoration. Rebind markers; financial events and revisions stay byte-for-byte equivalent.
     events = deepcopy(content["events"])
     for e in events:
@@ -1983,6 +2140,9 @@ def restore_to_empty_spreadsheet(source_store, target_spreadsheet, content):
     checked = target.read()
     if checked.revision != content["ledger_revision"]:
         raise LedgerError("還原後版本不符；請保留目的地供檢查，勿切換設定。")
+    if restored_book:
+        from ledger_books import publish_book
+        publish_book(target_spreadsheet, restored_book, core=book_core())
     return target
 
 
@@ -1990,7 +2150,8 @@ def render_data(st, store, ledger):
     st.subheader("備份與資料健康")
     rejected = [(rid, s) for rid, s in ledger.statuses.items() if "未入帳" in s["status"]]
     st.write(f"有效事件 {len(ledger.accepted)} 筆 · 未入帳事件 {len(rejected)} 筆")
-    st.caption(f"試算表 ID：{store.spreadsheet.id} · 基準工作表 ID：{store.baseline_id} · 帳本版本：{ledger.revision[:16]}")
+    st.caption(f"目前帳本：{store.ledger_name} · 試算表 ID：{store.spreadsheet.id} · 基準工作表 ID：{store.baseline_id} · 帳本版本：{ledger.revision[:16]}")
+    st.caption("此處的 JSON／CSV 只匯出目前帳本；如需備份所有帳本，請逐一切換並匯出。")
     for warning in ledger.warnings:
         st.warning(warning)
     if rejected:
@@ -2009,7 +2170,7 @@ def render_data(st, store, ledger):
         if st.session_state.get("backup_revision") != ledger.revision:
             st.warning("這份已產生備份早於目前帳本，請重新產生最新版。")
         st.download_button("下載完整 JSON 備份", st.session_state["backup_bytes"],
-                           file_name=f"tracker_backup_{datetime.now(TZ):%Y%m%d_%H%M%S}.json", mime="application/json")
+                           file_name=f"tracker_backup_{store.ledger_id}_{datetime.now(TZ):%Y%m%d_%H%M%S}.json", mime="application/json")
     with st.expander("驗證備份與還原至另一份空白試算表"):
         upload = st.file_uploader("選擇完整備份 JSON", type=["json"], key="backup_upload")
         if upload:
@@ -2026,7 +2187,11 @@ def render_data(st, store, ledger):
                     target_spreadsheet = store.client.open_by_key(target_id.strip())
                     result = restore_to_empty_spreadsheet(store, target_spreadsheet, content)
                     st.success("還原完成並通過回放檢查。確認後將 Secrets 的試算表與工作表 ID 改為下方設定。")
-                    st.code(f'SPREADSHEET_ID = "{target_id.strip()}"\nBASELINE_WORKSHEET_ID = {result.baseline_id}', language="toml")
+                    if result.ledger_id == "main":
+                        st.code(f'SPREADSHEET_ID = "{target_id.strip()}"\nBASELINE_WORKSHEET_ID = {result.baseline_id}', language="toml")
+                    else:
+                        st.code(f'SPREADSHEET_ID = "{target_id.strip()}"', language="toml")
+                        st.info("新試算表的原本帳本保持空白；請從「目前帳本」選擇 " + result.ledger_name + "。")
             except Exception as exc:
                 show_failure(st, exc, "備份驗證／還原失敗")
     with st.expander("匯入待確認操作（刷新後保留同一 ID）"):
@@ -2038,6 +2203,7 @@ def render_data(st, store, ledger):
                     raise LedgerError("待確認檔案校驗失敗。")
                 if st.session_state.get("pending_event"):
                     raise LedgerError("已有待確認操作，請先處理。")
+                check_event_book(store, event)
                 st.session_state["pending_event"] = event
                 st.session_state["pending_sent"] = True
                 st.session_state.pop("pending_rejected", None)
@@ -2076,11 +2242,13 @@ def render():
                 st.rerun()
     try:
         store = session_store(st)
+        store = render_book_selector(st, store)
         ledger = read_display(st, store, "ledger", store.read, ttl=15)
     except Exception as exc:
         show_failure(st, exc, "帳本無法載入，已停止操作")
         st.caption("若有損壞，先從 Google Sheets 下載原始工作表備份，再依錯誤列號檢查。勿清空 A1 或 Events。")
         st.stop()
+    st.caption("目前帳本：" + store.ledger_name)
     if st.session_state.get("flash"):
         st.success(st.session_state.pop("flash"))
     pending = render_pending(st, store, ledger)

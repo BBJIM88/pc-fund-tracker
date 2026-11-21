@@ -67,6 +67,25 @@ def run_snapshot_job(store, *, quote_loader=None):
     raise AssertionError("Snapshot retry limit was not enforced.")
 
 
+def run_all_snapshot_jobs(store, *, quote_loader=None):
+    """A failure in one ledger must not prevent the others from being saved."""
+    quotes = {}
+    quote_loader = app.quote_uncached if quote_loader is None else quote_loader
+
+    def cached_quote(ticker):
+        if ticker not in quotes:
+            quotes[ticker] = quote_loader(ticker)
+        return quotes[ticker]
+
+    results, errors = [], []
+    for book in store.list_books():
+        try:
+            results.append(run_snapshot_job(store.for_book(book), quote_loader=cached_quote))
+        except Exception as exc:
+            errors.append(type(exc).__name__)
+    return {"results": results, "errors": errors}
+
+
 @contextmanager
 def quiet_service_output():
     """Third-party diagnostics can contain ticker/account details or credentials."""
@@ -84,15 +103,20 @@ def quiet_service_output():
 def main():
     try:
         with quiet_service_output():
-            result = run_snapshot_job(store_from_environment())
-            day = date.fromisoformat(result["snapshot"]["day"]).isoformat()
-            status = "written" if result["written"] else "unchanged"
+            summary = run_all_snapshot_jobs(store_from_environment())
+            results, errors = summary["results"], summary["errors"]
+            day = date.fromisoformat(results[0]["snapshot"]["day"]).isoformat() if results else None
+            status = "written" if any(result["written"] for result in results) else "unchanged"
     except Exception as exc:
         # Deliberately omit exception messages, reprs, and tracebacks from public job logs.
         print(f"Snapshot job failed ({type(exc).__name__}).", file=sys.stderr)
         return 1
-    print(f"{day} {status}")
-    return 0
+    if day:
+        suffix = f" ledgers={len(results)}" if len(results) > 1 else ""
+        print(f"{day} {status}{suffix}")
+    for error in errors:
+        print(f"Snapshot job failed ({error}).", file=sys.stderr)
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":
